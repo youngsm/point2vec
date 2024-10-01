@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from point2vec.modules.EMA import EMA
 from point2vec.modules.masking import PointcloudMasking
-from point2vec.modules.pointnet import PointcloudTokenizer
+from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
 
@@ -19,6 +19,7 @@ from point2vec.utils import transforms
 class Point2Vec(pl.LightningModule):
     def __init__(
         self,
+        num_channels: int = 3,
         tokenizer_num_groups: int = 64,
         tokenizer_group_size: int = 32,
         tokenizer_group_radius: float | None = None,
@@ -37,6 +38,8 @@ class Point2Vec(pl.LightningModule):
         decoder_attention_dropout: float = 0.05,
         decoder_drop_path_rate: float = 0.25,
         decoder_add_pos_at_every_layer: bool = True,
+        position_encoder: Optional[str] = "nn",
+        embedding_type: str = "mini",
         d2v_target_layers: List[int] = [6, 7, 8, 9, 10, 11],
         d2v_target_layer_part: str = "final",  # ffn, final
         d2v_target_layer_norm: Optional[str] = "layer",  # instance, layer, group, batch
@@ -51,18 +54,18 @@ class Point2Vec(pl.LightningModule):
         lr_scheduler_linear_warmup_start_lr: float = 1e-6,
         lr_scheduler_cosine_eta_min: float = 1e-6,
         train_transformations: List[str] = [
-            "subsample",
-            "scale",
+            # "subsample",
+            # "scale",
             "center",
-            "unit_sphere",
+            # "unit_sphere",
             "rotate",
         ],  # subsample, scale, center, unit_sphere, rotate, translate, height_norm
-        val_transformations: List[str] = ["subsample", "center", "unit_sphere"],
+        val_transformations: List[str] = ["center"],
         transformation_subsample_points: int = 1024,
         transformation_scale_min: float = 0.8,
         transformation_scale_max: float = 1.2,
         transformation_scale_symmetries: Tuple[int, int, int] = (1, 0, 1),
-        transformation_rotate_dims: List[int] = [1],
+        transformation_rotate_dims: List[int] = [0, 1, 2],
         transformation_rotate_degs: Optional[int] = None,
         transformation_translate: float = 0.2,
         transformation_height_normalize_dim: int = 1,
@@ -104,17 +107,26 @@ class Point2Vec(pl.LightningModule):
             [build_transformation(name) for name in val_transformations]
         )
 
-        self.positional_encoding = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-            nn.Linear(128, encoder_dim),
-        )
+        if position_encoder == "nn":
+            self.positional_encoding = nn.Sequential(
+                nn.Linear(3, 128),
+                nn.GELU(),
+                nn.Linear(128, encoder_dim),
+            )
+        elif position_encoder == "sine":
+            self.positional_encoding = PositionEmbeddingCoordsSine(
+                3, encoder_dim, 1
+            )
+        else:
+            raise ValueError(f"Unknown position encoder: {position_encoder}")
 
         self.tokenizer = PointcloudTokenizer(
             num_groups=tokenizer_num_groups,
             group_size=tokenizer_group_size,
             group_radius=tokenizer_group_radius,
             token_dim=encoder_dim,
+            num_channels=num_channels,
+            embedding_type=embedding_type,
         )
 
         self.masking = PointcloudMasking(ratio=d2v_masking_ratio, type=d2v_masking_type)
@@ -193,17 +205,17 @@ class Point2Vec(pl.LightningModule):
         # see: https://github.com/Lightning-AI/lightning/issues/12317
         # Because of that, we allow to workaround this crash by manually setting this value with `fix_estimated_stepping_batches`.
 
-        svm_validation: Dict[str, pl.LightningDataModule] = self.hparams.svm_validation  # type: ignore
-        for dataset_name, datamodule in svm_validation.items():
-            datamodule.setup("fit")
-            for logger in self.loggers:
-                if isinstance(logger, WandbLogger):
-                    logger.experiment.define_metric(
-                        f"svm_train_acc_{dataset_name}", summary="last,max"
-                    )
-                    logger.experiment.define_metric(
-                        f"svm_val_acc_{dataset_name}", summary="last,max"
-                    )
+        # svm_validation: Dict[str, pl.LightningDataModule] = self.hparams.svm_validation  # type: ignore
+        # for dataset_name, datamodule in svm_validation.items():
+        #     datamodule.setup("fit")
+        #     for logger in self.loggers:
+        #         if isinstance(logger, WandbLogger):
+        #             logger.experiment.define_metric(
+        #                 f"svm_train_acc_{dataset_name}", summary="last,max"
+        #             )
+        #             logger.experiment.define_metric(
+        #                 f"svm_val_acc_{dataset_name}", summary="last,max"
+        #             )
 
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
@@ -254,13 +266,13 @@ class Point2Vec(pl.LightningModule):
         return predictions, targets
 
     def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # inputs: (B, N, 3)
-        tokens, centers = self.tokenizer(inputs)  # (B, T, C), (B, T, 3)
+        # inputs: (B, N, num_channels)
+        tokens, centers, _ = self.tokenizer(inputs)  # (B, T, C), (B, T, 3)
         mask = self.masking(centers)  # (B, T)
         return self.forward(tokens, centers, mask)
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
-        # inputs: (B, N, 3)
+        # inputs: (B, N, num_channels)
         points, _ = batch
         points = self.train_transformations(points)
         x, y = self._perform_step(points)
@@ -273,7 +285,7 @@ class Point2Vec(pl.LightningModule):
     def validation_step(
         self, batch, batch_idx: int
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        # inputs: (B, N, 3)
+        # inputs: (B, N, num_channels)
         points, _ = batch
         points = self.val_transformations(points)
         x, y = self._perform_step(points)
@@ -305,7 +317,7 @@ class Point2Vec(pl.LightningModule):
                 points: torch.Tensor = points.cuda()
                 label: torch.Tensor = label.cuda()
                 points = self.val_transformations(points)
-                embeddings, centers = self.tokenizer(points)
+                embeddings, centers, _ = self.tokenizer(points)
                 pos = self.positional_encoding(centers)
                 x = self.student(embeddings, pos).last_hidden_state
                 x = torch.cat([x.max(dim=1).values, x.mean(dim=1)], dim=-1)
