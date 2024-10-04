@@ -7,14 +7,16 @@ from glob import glob
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 from typing import Optional
+from torch.nn.utils.rnn import pad_sequence
 
 class LArNet(Dataset):
-    def __init__(self, data_path: str, emin: float = 1.0e-6, emax: float = 20.0, normalize: bool = True):
+    def __init__(self, data_path: str, emin: float = 1.0e-6, emax: float = 20.0, normalize: bool = True, remove_low_energy_scatters: bool = False):
         self.data_path = data_path
         self.h5_files = glob(data_path)
         self.emin = emin
         self.emax = emax
         self.normalize = normalize
+        self.remove_low_energy_scatters = remove_low_energy_scatters
 
         self.lengths = []
 
@@ -71,8 +73,12 @@ class LArNet(Dataset):
         idx = idx - self.cumulative_lengths[h5_idx]
         idx = self.indices[h5_idx][idx]
         data = h5_file["point"][idx].reshape(-1, 8)[:, :4]
-
         cluster_size, semantic_id = h5_file["cluster"][idx].reshape(-1, 5)[:, [0,-1]].T
+
+        # remove first particle from data, i.e. low energy scatters
+        if self.remove_low_energy_scatters:
+            data = data[cluster_size[0]:]
+            semantic_id, cluster_size = semantic_id[1:], cluster_size[1:]
         data_semantic_id = np.repeat(semantic_id, cluster_size)
 
         # Normalize
@@ -101,8 +107,17 @@ class LArNet(Dataset):
     def collate_fn(batch):
         data = [item[0] for item in batch]
         semantic_id = [item[1] for item in batch]
+        lengths = torch.tensor(
+            [points.size(0) for points in data], dtype=torch.long
+        )  # Shape: (B,)
+        padded_points = pad_sequence(data, batch_first=True)  # Shape: (B, N_max, 4)
+        padded_semantic_id = pad_sequence(semantic_id, batch_first=True, padding_value=-1)  # Shape: (B, N_max)
 
-        return pad_with_first_point(data), pad_with_first_point(semantic_id)
+        return (
+            padded_points,
+            lengths,
+            padded_semantic_id,
+        )
 
 class LArNetDataModule(pl.LightningDataModule):
     def __init__(
