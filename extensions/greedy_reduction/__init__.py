@@ -1,1 +1,1 @@
-from .greedy_reduction_extension import greedy_reduction
+from .greedy_reduction import greedy_reduction

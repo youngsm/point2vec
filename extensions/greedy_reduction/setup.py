@@ -4,13 +4,13 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
     name="greedy_reduction",
-    version="0.1",
+    version="0.0",
     description="Greedy Reduction for Sphere Packing",
     author="Sam Young",
     author_email="youngsam@stanford.edu",
     ext_modules=[
         CUDAExtension(
-            name="greedy_reduction_extension",
+            name="greedy_reduction",
             sources=[
                 "greedy_reduction.cpp",
                 "greedy_reduction_cuda.cu",
