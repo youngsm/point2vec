@@ -3,6 +3,7 @@ from pytorch3d.ops.utils import masked_gather
 import torch
 from typing import Tuple
 import torch.nn as nn
+from greedy_reduction import greedy_reduction
 
 def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     """
@@ -68,6 +69,55 @@ def select_topk_by_energy(
     topk_idx[~mask_valid] = -1
 
     return topk_idx
+
+
+def cull_spheres_cuda(sphere_centers, overlap_factor=0.7, K=512, radius=25 / 760):
+    """
+    Perform sphere culling using CUDA to remove overlapping spheres.
+
+    Args:
+        sphere_centers: Tensor of shape (N, P, 3) containing the coordinates of sphere centers.
+        overlap_factor: Factor to determine the query radius for overlap checking.
+        K: Number of neighbors to consider in ball query.
+        radius: Radius of the spheres.
+
+    Returns:
+        retain: Boolean tensor of shape (N, P) indicating which spheres to retain.
+    """
+    device = sphere_centers.device
+    p1 = sphere_centers
+    p2 = sphere_centers
+
+    query_radius = 2 * radius * overlap_factor  # Example: 2.4 for R=1.0
+
+    dists, idx, nn = ball_query(
+        p1=p1,
+        p2=p2,
+        K=K,
+        radius=query_radius,
+        return_nn=True,
+    )
+
+    N, P, K, D = nn.shape
+    device = nn.device
+
+    # Compute overlap counts by excluding self (assuming self is always included)
+    # Create a tensor of point indices
+    point_indices = (
+        torch.arange(P, device=device).view(1, P, 1).repeat(N, 1, K)
+    )  # (N, P, K)
+    # Compare with idx to exclude self
+    mask = idx != point_indices
+    overlap_counts = mask.sum(dim=-1)  # (N, P)
+
+    # Sort overlap counts in descending order
+    sorted_overlap_counts, sorted_indices = overlap_counts.sort(
+        dim=-1, descending=True
+    )  # Both: (N, P)
+
+    retain = greedy_reduction(sorted_indices, idx)
+
+    return retain
 
 
 class PointcloudGrouping(nn.Module):
