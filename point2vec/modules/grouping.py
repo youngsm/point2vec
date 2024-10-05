@@ -70,10 +70,9 @@ def select_topk_by_energy(
 
     return topk_idx
 
-
-def cull_spheres_cuda(sphere_centers, overlap_factor=0.7, K=512, radius=25 / 760):
+def cull_spheres(sphere_centers, overlap_factor=0.7, K=512, radius=25 / 760):
     """
-    Perform sphere culling using CUDA to remove overlapping spheres.
+    Perform sphere culling to remove overlapping spheres.
 
     Args:
         sphere_centers: Tensor of shape (N, P, 3) containing the coordinates of sphere centers.
@@ -90,6 +89,8 @@ def cull_spheres_cuda(sphere_centers, overlap_factor=0.7, K=512, radius=25 / 760
 
     query_radius = 2 * radius * overlap_factor  # Example: 2.4 for R=1.0
 
+
+    K = sphere_centers.shape[1]
     dists, idx, nn = ball_query(
         p1=p1,
         p2=p2,
@@ -125,12 +126,16 @@ class PointcloudGrouping(nn.Module):
         self,
         num_groups: int,
         group_size: int,
-        group_radius: float | None = None,
+        group_radius: float,
+        upscale_group_size: int = 512,
+        overlap_factor: float = 0.7,
     ):
         super().__init__()
         self.num_groups = num_groups
         self.group_size = group_size  # Desired final group size (K_new)
         self.group_radius = group_radius
+        self.upscale_group_size = upscale_group_size
+        self.overlap_factor = overlap_factor
 
     def forward(
         self,
@@ -148,61 +153,69 @@ class PointcloudGrouping(nn.Module):
             lengths=lengths,
             random_start_point=True,
         )  # (B, G, 3)
+
         semantic_id_groups = None
 
-        if self.group_radius is None:
-            # Use KNN grouping
-            _, idx, _ = knn_points(
-                group_centers.float(),
-                points[:, :, :3].float(),
-                lengths1=None,
-                lengths2=lengths,
-                K=self.group_size,
-                return_sorted=False,
-                return_nn=False,
-            )  # idx: (B, G, K)
-            groups = knn_gather(points, idx)  # (B, G, K, C)
-            if semantic_id is not None:
-                semantic_id_groups = knn_gather(semantic_id, idx)  # (B, G, K)
-        else:
-            # Use ball query with energy-based selection
-            K_original = 5 * self.group_size  # Initial K
-
+        # Use ball query with energy-based selection
+        retain = cull_spheres(group_centers, overlap_factor=self.overlap_factor, K=self.num_groups, radius=self.group_radius)
+        lengths1 = retain.sum(dim=1)
+        if self.group_radius is not None:
             dists, idx, _ = ball_query(
                 group_centers.float(),
                 points[:, :, :3].float(),
-                K=K_original,
+                K=self.upscale_group_size,
                 radius=self.group_radius,
-                lengths1=None,  # Lengths of group centers (None since all have num_groups)
+                lengths1=lengths1,  # Lengths of group centers (None since all have num_groups)
                 lengths2=lengths,
                 return_nn=False,
-            )  # idx: (B, G, K_original)
+            )  # idx: (B, G, K_big)
 
             # Create invalid index mask
             invalid_idx_mask = idx == -1  # Shape: (B, G, K_original)
 
-            # Energy-based selection
+            # Energy-based selection (K_big --> K by taking top K energies)
             idx = select_topk_by_energy(
                 points=points,
                 idx=idx,
                 K_new=self.group_size,
                 invalid_idx_mask=invalid_idx_mask,
                 energies_idx=3,  # Assuming energy is at index 3
-            )  # idx: (B, G, K_new)
+            )  # idx: (B, G, K)
 
-            if semantic_id is not None:
-                semantic_id_groups = masked_gather(semantic_id, idx)  # (B, G, K_new)
-                semantic_id_groups[idx.eq(-1)] = -1
+        else:
+            _, idx, _ = knn_points(
+                group_centers.float(),
+                points[:, :, :3].float(),
+                lengths1=lengths1,
+                lengths2=lengths,
+                K=self.group_size,
+                return_sorted=False,
+                return_nn=False,
+            )  # (B, G, K)
 
-            groups = masked_gather(points, fill_empty_indices(idx))  # (B, G, K_new, C)
+        # Gather semantic ids
+        if semantic_id is not None:
+            semantic_id_groups = masked_gather(semantic_id, idx)  # (B, G, K)
+            semantic_id_groups[idx.eq(-1)] = -1
+
+        # Gather points
+        groups = masked_gather(points, fill_empty_indices(idx))  # (B, G, K, C)
+
+        # Create embedding mask (i.e. which groups/embeddings to ignore in transformer)
+        B, G, K, C = groups.shape
+        group_lengths = (~idx.eq(-1)).all(2).sum(1) # (B,)
+        embedding_mask = torch.arange(G, device=points.device).repeat(B, 1) < group_lengths.unsqueeze(1)
 
         # Normalize group coordinates
         groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers.unsqueeze(2)
         if self.group_radius is not None:
-            groups = groups / self.group_radius  # Normalize by group radius
+            groups = (
+                groups / self.group_radius
+            )  # proposed by PointNeXT to make relative coordinates less small
 
         return (
             groups,
             group_centers,
+            embedding_mask,
             semantic_id_groups,
-        )  # (B, G, K_new, C), (B, G, 3), (B, G, K_new)
+        )  # (B, G, K, C), (B, G, 3), (B, G), (B, G, K)
