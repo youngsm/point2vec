@@ -10,7 +10,7 @@ from sklearn.svm import SVC
 from torch.utils.data import DataLoader
 
 from point2vec.modules.EMA import EMA
-from point2vec.modules.masking import PointcloudMasking
+from point2vec.modules.masking import PointcloudMasking, VariablePointcloudMasking
 from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
@@ -20,9 +20,12 @@ class Point2Vec(pl.LightningModule):
     def __init__(
         self,
         num_channels: int = 3,
-        tokenizer_num_groups: int = 64,
+        tokenizer_num_init_groups: int = 64,
+        tokenizer_context_length: int = 256,
         tokenizer_group_size: int = 32,
         tokenizer_group_radius: float | None = None,
+        tokenizer_upscale_group_size: int | None = None,
+        tokenizer_overlap_factor: float | None = None,
         d2v_masking_ratio: float = 0.65,
         d2v_masking_type: str = "rand",  # rand, block
         encoder_dim: int = 384,
@@ -107,29 +110,35 @@ class Point2Vec(pl.LightningModule):
             [build_transformation(name) for name in val_transformations]
         )
 
-        if position_encoder == "nn":
-            self.positional_encoding = nn.Sequential(
+        match position_encoder:
+            case "nn":
+                self.positional_encoding = nn.Sequential(
                 nn.Linear(3, 128),
                 nn.GELU(),
                 nn.Linear(128, encoder_dim),
             )
-        elif position_encoder == "sine":
-            self.positional_encoding = PositionEmbeddingCoordsSine(
+            case "sine":
+                self.positional_encoding = PositionEmbeddingCoordsSine(
                 3, encoder_dim, 1
             )
-        else:
-            raise ValueError(f"Unknown position encoder: {position_encoder}")
+            case _:
+                raise ValueError(f"Unknown position encoder: {position_encoder}")
 
         self.tokenizer = PointcloudTokenizer(
-            num_groups=tokenizer_num_groups,
+            num_init_groups=tokenizer_num_init_groups,
+            context_length=tokenizer_context_length,
             group_size=tokenizer_group_size,
             group_radius=tokenizer_group_radius,
+            upscale_group_size=tokenizer_upscale_group_size,
+            overlap_factor=tokenizer_overlap_factor,
             token_dim=encoder_dim,
             num_channels=num_channels,
             embedding_type=embedding_type,
         )
 
-        self.masking = PointcloudMasking(ratio=d2v_masking_ratio, type=d2v_masking_type)
+        self.masking = VariablePointcloudMasking(
+            ratio=d2v_masking_ratio, type=d2v_masking_type
+        )
 
         init_std = 0.02
         self.mask_token = nn.Parameter(torch.zeros(encoder_dim))
@@ -225,57 +234,63 @@ class Point2Vec(pl.LightningModule):
         self,
         embeddings: torch.Tensor,
         centers: torch.Tensor,
-        mask: torch.Tensor,
+        masked: torch.Tensor,
+        unmasked: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # tokens: (B, T, C)
         # centers: (B, T, 3)
         # mask: (B, T)
-
-        w = mask.unsqueeze(-1).type_as(embeddings)
-        corrupted_embeddings = (1 - w) * embeddings + w * self.mask_token
-
+        w_m = masked.unsqueeze(-1)
+        w_u = unmasked.unsqueeze(-1)
+        corrupted_embeddings = w_u * embeddings + w_m * self.mask_token
+        pos = self.positional_encoding(centers)
+        decoder_mask = w_m.bool().squeeze() | w_u.bool().squeeze()
         if self.hparams.decoder:  # type: ignore
             B, _, C = embeddings.shape
-            visible_embeddings = corrupted_embeddings[~mask].reshape(B, -1, C)
-            masked_embeddings = corrupted_embeddings[mask].reshape(B, -1, C)
 
-            pos = self.positional_encoding(centers)
-            visible_pos = pos[~mask].reshape(B, -1, C)
-            masked_pos = pos[mask].reshape(B, -1, C)
+            visible_embeddings = torch.zeros_like(corrupted_embeddings)
+            visible_embeddings[unmasked] = corrupted_embeddings[unmasked]
+
+            masked_embeddings = torch.zeros_like(corrupted_embeddings)
+            masked_embeddings[masked] = corrupted_embeddings[masked]
+
             output_embeddings = self.student(
-                visible_embeddings, visible_pos
-            ).last_hidden_state  # (B, T, C)
+                visible_embeddings, pos, w_u.bool().squeeze()
+            ).last_hidden_state # (B, T, C)
+
+            total_embeddings = torch.zeros_like(corrupted_embeddings)
+            total_embeddings[unmasked] = output_embeddings[unmasked]
+            total_embeddings[masked] = masked_embeddings[masked]
 
             decoder_output_tokens = self.decoder(
-                torch.cat([output_embeddings, masked_embeddings], dim=1),
-                torch.cat([visible_pos, masked_pos], dim=1),
+                total_embeddings, pos, decoder_mask
             ).last_hidden_state
 
-            predictions = self.regressor(
-                decoder_output_tokens[:, -masked_embeddings.shape[1] :].reshape(-1, C)
-            )
+            masked_output_tokens = decoder_output_tokens[masked]
+
+            predictions = self.regressor(masked_output_tokens)
         else:  # no decoder => like data2vec
             pos = self.positional_encoding(centers)
             output_embeddings = self.student(
-                corrupted_embeddings, pos
+                corrupted_embeddings, pos, decoder_mask
             ).last_hidden_state  # (B, T, C)
-            predictions = self.regressor(output_embeddings[mask])
+            predictions = self.regressor(output_embeddings[masked])
 
-        targets = self.generate_targets(embeddings, pos)[mask]
+        targets = self.generate_targets(embeddings, pos, decoder_mask)[masked[decoder_mask]]
 
         return predictions, targets
 
-    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _perform_step(self, inputs: torch.Tensor, lengths: torch.Tensor, semantic_labels: torch.Tensor | None) -> Tuple[torch.Tensor, torch.Tensor]:
         # inputs: (B, N, num_channels)
-        tokens, centers, _ = self.tokenizer(inputs)  # (B, T, C), (B, T, 3)
-        mask = self.masking(centers)  # (B, T)
-        return self.forward(tokens, centers, mask)
+        tokens, centers, mask, _ = self.tokenizer(inputs, lengths, semantic_labels)  # (B, T, C), (B, T, 3)
+        masked, unmasked = self.masking(centers, mask.sum(-1))  # (B, T), (B, T)
+        return self.forward(tokens, centers, masked, unmasked)
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         # inputs: (B, N, num_channels)
-        points, _ = batch
+        points, lengths, semantic_labels = batch
         points = self.train_transformations(points)
-        x, y = self._perform_step(points)
+        x, y = self._perform_step(points, lengths, semantic_labels)
         loss = self.loss_func(x, y)
         self.log("train_loss", loss, on_epoch=True)
         self.log("train_pred_std", self.token_std(x))  # should always be > 0.01
@@ -286,9 +301,9 @@ class Point2Vec(pl.LightningModule):
         self, batch, batch_idx: int
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         # inputs: (B, N, num_channels)
-        points, _ = batch
+        points, lengths, semantic_labels = batch
         points = self.val_transformations(points)
-        x, y = self._perform_step(points)
+        x, y = self._perform_step(points, lengths, semantic_labels)
         loss = self.loss_func(x, y)
         self.log("val_loss", loss)
         self.log("val_pred_std", self.token_std(x))
@@ -349,6 +364,7 @@ class Point2Vec(pl.LightningModule):
         self,
         tokens: torch.Tensor,
         pos: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         assert self.teacher.ema_model is not None  # always false
         self.teacher.ema_model.eval()
@@ -357,6 +373,7 @@ class Point2Vec(pl.LightningModule):
         output: TransformerEncoderOutput = self.teacher(
             tokens,
             pos,
+            mask,
             return_hidden_states=d2v_target_layer_part == "final",
             return_ffns=d2v_target_layer_part == "ffn",
         )
@@ -369,7 +386,7 @@ class Point2Vec(pl.LightningModule):
         else:
             raise ValueError()
         target_layers = [
-            target_layers[i] for i in d2v_target_layers
+            target_layers[i][mask] for i in d2v_target_layers
         ]  # [(B, T, C)]
 
         # pre norm
@@ -405,7 +422,6 @@ class Point2Vec(pl.LightningModule):
         targets = torch.stack(target_layers, dim=0).mean(0)  # (B, T, C)
 
         # post norm
-
         target_norm = self.hparams.d2v_target_norm  # type: ignore
         if target_norm == "instance":
             targets = F.instance_norm(targets.transpose(1, 2)).transpose(1, 2)
