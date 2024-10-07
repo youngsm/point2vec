@@ -124,6 +124,8 @@ class PointcloudTokenizer(nn.Module):
         num_groups: int,
         group_size: int,
         group_radius: float | None,
+        upscale_group_size: int | None,
+        overlap_factor: float | None,
         token_dim: int,
         num_channels: int,
         embedding_type: str = "mini",
@@ -131,7 +133,11 @@ class PointcloudTokenizer(nn.Module):
         super().__init__()
         self.token_dim = token_dim
         self.grouping = PointcloudGrouping(
-            num_groups=num_groups, group_size=group_size, group_radius=group_radius
+            num_groups=num_groups, 
+            group_size=group_size, 
+            group_radius=group_radius, 
+            upscale_group_size=upscale_group_size, 
+            overlap_factor=overlap_factor
         )
 
         if embedding_type == "mini":
@@ -141,20 +147,21 @@ class PointcloudTokenizer(nn.Module):
         else:
             raise ValueError(f"Unknown embedding type: {embedding_type}")
 
-    def forward(self, points: torch.Tensor, semantic_id: torch.Tensor | None = None, return_group: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, points: torch.Tensor, lengths: torch.Tensor, semantic_id: torch.Tensor | None = None, return_group: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         # points: (B, N, num_channels)
+        # lengths: (B,)
         group: torch.Tensor
         group_center: torch.Tensor
         tokens: torch.Tensor
         semantic_id_groups: torch.Tensor | None
 
-
-        group, group_center, semantic_id_groups = self.grouping(points, semantic_id)  # (B, G, K, C), (B, G, 3), (B, G, K)
+        output = self.grouping(points, lengths, semantic_id)  # (B, G, K, C), (B, G, 3), (B, G, K)
+        group, group_center, embedding_mask,semantic_id_groups = output
         B, G, S, C = group.shape
         tokens = self.embedding(group.reshape(B * G, S, C)).reshape(
             B, G, self.token_dim
         )  # (B, G, C')
         if return_group:
-            return tokens, group_center, semantic_id_groups, group
+            return tokens, group_center, embedding_mask,semantic_id_groups, group
         else:
-            return tokens, group_center, semantic_id_groups
+            return tokens, group_center, embedding_mask,semantic_id_groups
