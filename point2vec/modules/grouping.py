@@ -3,7 +3,7 @@ from pytorch3d.ops.utils import masked_gather
 import torch
 from typing import Tuple
 import torch.nn as nn
-from greedy_reduction import greedy_reduction
+from cnms import cnms
 
 def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     """
@@ -70,57 +70,6 @@ def select_topk_by_energy(
 
     return topk_idx
 
-def cull_spheres(sphere_centers, overlap_factor=0.7, K=512, radius=25 / 760):
-    """
-    Perform sphere culling to remove overlapping spheres.
-
-    Args:
-        sphere_centers: Tensor of shape (N, P, 3) containing the coordinates of sphere centers.
-        overlap_factor: Factor to determine the query radius for overlap checking.
-        K: Number of neighbors to consider in ball query.
-        radius: Radius of the spheres.
-
-    Returns:
-        retain: Boolean tensor of shape (N, P) indicating which spheres to retain.
-    """
-    device = sphere_centers.device
-    p1 = sphere_centers
-    p2 = sphere_centers
-
-    query_radius = 2 * radius * overlap_factor  # Example: 2.4 for R=1.0
-
-
-    K = sphere_centers.shape[1]
-    dists, idx, nn = ball_query(
-        p1=p1,
-        p2=p2,
-        K=K,
-        radius=query_radius,
-        return_nn=True,
-    )
-
-    N, P, K, D = nn.shape
-    device = nn.device
-
-    # Compute overlap counts by excluding self (assuming self is always included)
-    # Create a tensor of point indices
-    point_indices = (
-        torch.arange(P, device=device).view(1, P, 1).repeat(N, 1, K)
-    )  # (N, P, K)
-    # Compare with idx to exclude self
-    mask = idx != point_indices
-    overlap_counts = mask.sum(dim=-1)  # (N, P)
-
-    # Sort overlap counts in descending order
-    sorted_overlap_counts, sorted_indices = overlap_counts.sort(
-        dim=-1, descending=True
-    )  # Both: (N, P)
-
-    retain = greedy_reduction(sorted_indices, idx)
-
-    return retain
-
-
 class PointcloudGrouping(nn.Module):
     def __init__(
         self,
@@ -156,42 +105,50 @@ class PointcloudGrouping(nn.Module):
 
         semantic_id_groups = None
 
-        # Use ball query with energy-based selection
-        retain = cull_spheres(group_centers, overlap_factor=self.overlap_factor, K=self.num_groups, radius=self.group_radius)
-        lengths1 = retain.sum(dim=1)
-        if self.group_radius is not None:
-            dists, idx, _ = ball_query(
-                group_centers.float(),
-                points[:, :, :3].float(),
-                K=self.upscale_group_size,
-                radius=self.group_radius,
-                lengths1=lengths1,  # Lengths of group centers (None since all have num_groups)
-                lengths2=lengths,
-                return_nn=False,
-            )  # idx: (B, G, K_big)
-
-            # Create invalid index mask
-            invalid_idx_mask = idx == -1  # Shape: (B, G, K_original)
-
-            # Energy-based selection (K_big --> K by taking top K energies)
-            idx = select_topk_by_energy(
-                points=points,
-                idx=idx,
-                K_new=self.group_size,
-                invalid_idx_mask=invalid_idx_mask,
-                energies_idx=3,  # Assuming energy is at index 3
-            )  # idx: (B, G, K)
-
+        # Sphere culling
+        if self.overlap_factor is not None:
+            retain = cnms(group_centers, overlap_factor=self.overlap_factor, radius=self.group_radius)
+            lengths1 = retain.sum(dim=1)
         else:
+            lengths1 = None
+
+        if self.upscale_group_size is None:
+            self.upscale_group_size = self.num_groups
+
+        if self.group_radius is None:
+            # KNN
             _, idx, _ = knn_points(
                 group_centers.float(),
                 points[:, :, :3].float(),
                 lengths1=lengths1,
                 lengths2=lengths,
-                K=self.group_size,
+                K=self.upscale_group_size,
                 return_sorted=False,
                 return_nn=False,
-            )  # (B, G, K)
+            )  # (B, G, K_big)
+        else:
+            # Ball query
+            _, idx, _ = ball_query(
+                group_centers.float(),
+                points[:, :, :3].float(),
+                K=self.upscale_group_size,
+                radius=self.group_radius,
+                lengths1=lengths1,
+                lengths2=lengths,
+                return_nn=False,
+            )  # idx: (B, G, K_big)
+
+        # Create invalid index mask
+        invalid_idx_mask = idx == -1  # Shape: (B, G, K_original)
+
+        # Energy-based selection (K_big --> K by taking top K energies)
+        idx = select_topk_by_energy(
+            points=points,
+            idx=idx,
+            K_new=self.group_size,
+            invalid_idx_mask=invalid_idx_mask,
+            energies_idx=3,  # Assuming energy is at index 3
+        )  # idx: (B, G, K)
 
         # Gather semantic ids
         if semantic_id is not None:
