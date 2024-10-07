@@ -1,5 +1,4 @@
 from pytorch3d.ops import ball_query, knn_gather, knn_points, sample_farthest_points
-from pytorch3d.ops.utils import masked_gather
 import torch
 from typing import Tuple
 import torch.nn as nn
@@ -14,8 +13,57 @@ def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     first_idx = idx[:, :, 0].unsqueeze(-1).expand(-1, -1, K)
     idx[mask] = first_idx[mask]  # replace -1 index with first index
     # print(f"DEBUG: {(len(idx[mask].view(-1)) / len(idx.view(-1))) * 100:.1f}% of ball query indices are empty")
-
     return idx
+
+def masked_gather(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """
+    Helper function for torch.gather to collect the points at
+    the given indices in idx where some of the indices might be -1 to
+    indicate padding. These indices are first replaced with 0.
+    Then the points are gathered after which the padded values
+    are set to 0.0.
+
+    Args:
+        points: (N, P, D) float32 tensor of points
+        idx: (N, K) or (N, P, K) long tensor of indices into points, where
+            some indices are -1 to indicate padding
+
+    Returns:
+        selected_points: (N, K, D) float32 tensor of points
+            at the given indices
+    """
+    if len(idx) != len(points):
+        raise ValueError("points and idx must have the same batch dimension")
+
+    N, P, D = points.shape
+
+    # Replace -1 values with 0 before expanding
+    idx = idx.clone()
+    idx[idx.eq(-1)] = 0
+
+    if idx.ndim == 3:
+        # Case: KNN, Ball Query where idx is of shape (N, P', K)
+        # where P' is not necessarily the same as P as the
+        # points may be gathered from a different pointcloud.
+        K = idx.shape[2]
+        # Match dimensions for points and indices
+        idx_expanded = idx[..., None].expand(-1, -1, -1, D)
+        points = points[:, :, None, :].expand(-1, -1, K, -1)
+    elif idx.ndim == 2:
+        # Farthest point sampling where idx is of shape (N, K)
+        idx_expanded = idx[..., None].expand(-1, -1, D)
+    else:
+        raise ValueError(f"idx format is not supported {idx.shape}")
+
+    # idx_expanded_mask = idx_expanded.eq(-1)
+    # Gather points
+    selected_points = points.gather(dim=1, index=idx_expanded)
+
+    # SY 10/7/24: this takes a while and doesn't seem to be necessary because
+    # we don't use the invalid indices for anything
+    # Replace padded values
+    # selected_points[idx_expanded_mask] = 0.0
+    return selected_points
 
 def select_topk_by_energy(
     points: torch.Tensor,
@@ -78,6 +126,7 @@ class PointcloudGrouping(nn.Module):
         group_radius: float,
         upscale_group_size: int = 512,
         overlap_factor: float = 0.7,
+        context_length: int = 256
     ):
         super().__init__()
         self.num_groups = num_groups
@@ -85,6 +134,7 @@ class PointcloudGrouping(nn.Module):
         self.group_radius = group_radius
         self.upscale_group_size = upscale_group_size
         self.overlap_factor = overlap_factor
+        self.context_length = context_length
 
     def forward(
         self,
@@ -170,9 +220,16 @@ class PointcloudGrouping(nn.Module):
                 groups / self.group_radius
             )  # proposed by PointNeXT to make relative coordinates less small
 
+        # G (max groups) --> T (context length)
+        groups = groups[:, :self.context_length] # (B, G, K, C) --> (B, T, K, C)
+        group_centers = group_centers[:, :self.context_length] # (B, G, 3) --> (B, T, 3)
+        embedding_mask = embedding_mask[:, :self.context_length] # (B, G) --> (B, T)
+        if semantic_id_groups is not None:
+            semantic_id_groups = semantic_id_groups[:, :, :self.context_length] # (B, G, K) --> (B, T, K)
+
         return (
             groups,
             group_centers,
             embedding_mask,
             semantic_id_groups,
-        )  # (B, G, K, C), (B, G, 3), (B, G), (B, G, K)
+        )  # (B, T, K, C), (B, T, 3), (B, T), (B, T, K)
