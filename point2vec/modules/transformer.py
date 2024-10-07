@@ -53,7 +53,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -63,6 +63,10 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        if attn_mask is not None:
+            attn = attn + attn_mask  # attn_mask should be broadcastable to attn
+
         attn = attn.softmax(dim=-1)
         _attn = attn
         attn = self.attn_drop(attn)
@@ -87,7 +91,6 @@ class Block(nn.Module):
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
     ):
-
         super().__init__()
 
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -114,8 +117,8 @@ class Block(nn.Module):
             drop=drop,
         )
 
-    def forward(self, x) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _x, attn = self.attn(self.norm1(x))
+    def forward(self, x, attn_mask=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _x, attn = self.attn(self.norm1(x), attn_mask)
         x = x + self.drop_path(_x)
         ffn = self.mlp(self.norm2(x))
         x = x + self.drop_path(ffn)
@@ -173,10 +176,29 @@ class TransformerEncoder(nn.Module):
         self,
         x: torch.Tensor,
         pos: torch.Tensor,
+        embedding_mask: torch.Tensor | None = None,
         return_hidden_states: bool = False,
         return_attentions: bool = False,
         return_ffns: bool = False,
     ) -> TransformerEncoderOutput:
+
+        if embedding_mask is not None:
+            B, N, C = x.shape
+            assert embedding_mask.shape == (
+                B,
+                N,
+            ), "embedding_mask must be of shape (B, N)"
+
+            # Create additive attention mask of shape (B, 1, 1, T)
+            attn_mask = (
+                torch.zeros_like(embedding_mask, dtype=torch.float32, device=x.device)
+                .masked_fill_(~embedding_mask, -torch.inf)
+                .unsqueeze(1)
+                .unsqueeze(1)
+            )
+        else:
+            attn_mask = None
+
         hidden_states = [] if return_hidden_states else None
         attentions = [] if return_attentions else None
         ffns = [] if return_ffns else None
@@ -185,7 +207,7 @@ class TransformerEncoder(nn.Module):
         for block in self.blocks:
             if self.add_pos_at_every_layer:
                 x = x + pos
-            x, attn, ffn = block(x)
+            x, attn, ffn = block(x, attn_mask)
             if return_hidden_states:
                 assert hidden_states is not None
                 hidden_states.append(x)
