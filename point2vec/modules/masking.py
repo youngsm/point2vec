@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from pytorch3d.ops import knn_points, sample_farthest_points
 from torch import nn
-
+from typing import Optional
 
 class PointcloudMasking(nn.Module):
     def __init__(self, ratio: float, type: str):
@@ -214,3 +214,202 @@ class VariablePointcloudMasking(nn.Module):
         mask.scatter_(dim=1, index=knn_idx, value=1.0)
         mask = mask.to(torch.bool)
         return mask
+
+
+# https://github.com/allenai/allennlp/blob/main/allennlp/modules/masked_layer_norm.py
+class MaskedLayerNorm(torch.nn.Module):
+    """
+    See LayerNorm for details.
+
+    Note, however, that unlike LayerNorm this norm includes a batch component.
+    """
+
+    def __init__(self, size: int, gamma0: float = 1.0) -> None:
+        super().__init__()
+        self.gamma = torch.nn.Parameter(torch.ones(1, 1, size) * gamma0)
+        self.beta = torch.nn.Parameter(torch.zeros(1, 1, size))
+        self.size = size
+
+    def forward(self, tensor: torch.Tensor, mask: torch.BoolTensor) -> torch.Tensor:
+        broadcast_mask = mask.unsqueeze(-1)
+        num_elements = broadcast_mask.sum() * self.size
+        mean = (tensor * broadcast_mask).sum() / num_elements
+        masked_centered = (tensor - mean) * broadcast_mask
+        std = torch.sqrt(
+            (masked_centered * masked_centered).sum() / num_elements
+            + tiny_value_of_dtype(tensor.dtype)
+        )
+        return (
+            self.gamma
+            * (tensor - mean)
+            / (std + tiny_value_of_dtype(tensor.dtype))
+            + self.beta
+        )
+
+# https://github.com/allenai/allennlp/blob/main/allennlp/nn/util.py
+def tiny_value_of_dtype(dtype: torch.dtype):
+    """
+    Returns a moderately tiny value for a given PyTorch data type that is used to avoid numerical
+    issues such as division by zero.
+    This is different from `info_value_of_dtype(dtype).tiny` because it causes some NaN bugs.
+    Only supports floating point dtypes.
+    """
+    if not dtype.is_floating_point:
+        raise TypeError("Only supports floating point dtypes.")
+    if dtype == torch.float or dtype == torch.double:
+        return 1e-13
+    elif dtype == torch.half:
+        return 1e-4
+    else:
+        raise TypeError("Does not support dtype " + str(dtype))
+
+# from MaskedLayerNorm
+def masked_layer_norm(input, normalized_shape, mask, gamma=1.0, beta=0.0):
+    """
+    Applies layer normalization to the input tensor while ignoring padded tokens.
+
+    Parameters:
+    - input (Tensor): Input tensor of shape (B, T, C)
+    - normalized_shape (int): Input shape from an expected input of size
+    - mask (Tensor): Mask tensor of shape (B, T) where valid tokens are 1 and padded tokens are 0
+    - gamma (float, optional): Scaling factor for the normalized tensor (default: 1.0)
+    - beta (float, optional): Bias factor for the normalized tensor (default: 0.0)
+
+    Returns:
+    - Tensor: The normalized tensor with the same shape as input
+    """
+    broadcast_mask = mask.unsqueeze(-1)
+    num_elements = broadcast_mask.sum() * normalized_shape
+    mean = (input * broadcast_mask).sum() / num_elements
+    masked_centered = (input - mean) * broadcast_mask
+    std = torch.sqrt(
+        (masked_centered * masked_centered).sum() / num_elements
+        + tiny_value_of_dtype(input.dtype)
+    )
+    return (
+        gamma * (input - mean) / (std + tiny_value_of_dtype(input.dtype)) + beta
+    ) * broadcast_mask
+
+
+# https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/drop.py
+def masked_drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True, mask: Optional[torch.Tensor] = None):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+
+    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+    'survival rate' as the argument.
+
+    """
+    """Drop paths (Stochastic Depth) per sample or per token, handling padded sequences.
+
+    Args:
+        x: Input tensor of shape (B, T, C)
+        drop_prob: Probability of dropping a path.
+        training: Whether the model is in training mode.
+        scale_by_keep: Whether to scale outputs by the keep probability.
+        mask: Optional padding mask of shape (B, T), where True indicates valid tokens.
+
+    Returns:
+        Tensor with paths dropped according to the specified drop probability, unaffected padded positions.
+    """
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+
+    # Generate random tensor for dropping paths
+    # Shape: (B, T, 1)
+    random_tensor = x.new_empty((x.shape[0], x.shape[1], 1)).bernoulli_(keep_prob)
+
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob)
+
+    # Apply the random tensor to x
+    x = x * random_tensor
+
+    # If mask is provided, ensure that padded positions remain zero
+    if mask is not None:
+        mask = mask.unsqueeze(-1).to(x.dtype)  # Shape: (B, T, 1)
+        x = x * mask
+
+    return x
+
+# https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/drop.py
+class MaskedDropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+    def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
+        super(MaskedDropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x, mask=None):
+        return masked_drop_path(x, self.drop_prob, self.training, self.scale_by_keep, mask)
+
+    def extra_repr(self):
+        return f'drop_prob={round(self.drop_prob,3):0.3f}'
+
+class MaskedBatchNorm1d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+        super(MaskedBatchNorm1d, self).__init__()
+        self.num_features = num_features
+        self.affine = affine
+
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))  # Gamma
+            self.bias = nn.Parameter(torch.zeros(num_features))   # Beta
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+        self.eps = eps
+        self.momentum = momentum
+
+        # Running stats
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+
+    def forward(self, x, mask):
+        # x: (B, C, L)
+        # mask: (B, 1, L)
+        B, C, L = x.size()
+
+        # Expand mask to match x's dimensions
+        mask = mask.expand_as(x)  # (B, C, L)
+
+        # Compute the total number of valid elements per channel
+        valid_elements = mask.sum(dim=(0, 2))  # (C,)
+        valid_elements = valid_elements.clamp(min=1)  # Avoid division by zero
+
+        # Zero out padded values in x
+        x_masked = x * mask
+
+        # Compute mean
+        mean = x_masked.sum(dim=(0, 2)) / valid_elements  # (C,)
+
+        # Compute variance
+        diff = x_masked - mean[None, :, None]
+        diff_squared = diff * diff
+        var = (diff_squared * mask).sum(dim=(0, 2)) / valid_elements  # (C,)
+
+        if self.training:
+            # Update running stats
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.detach()
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.detach()
+        else:
+            # Use running stats during evaluation
+            mean = self.running_mean
+            var = self.running_var
+
+        # Normalize
+        x_normed = (x - mean.view(1, C, 1)) / torch.sqrt(var.view(1, C, 1) + self.eps)
+
+        # Apply affine transformation if enabled
+        if self.affine:
+            x_normed = x_normed * self.weight[None, :, None] + self.bias[None, :, None]
+
+        # Zero out padded positions again
+        x_normed = x_normed * mask
+
+        return x_normed

@@ -3,8 +3,16 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath
+# from timm.models.layers import DropPath
 from torch import nn
+from point2vec.modules.masking import MaskedLayerNorm, MaskedDropPath
+
+class Identity(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, mask=None):
+        return x
 
 
 class Mlp(nn.Module):
@@ -89,13 +97,13 @@ class Block(nn.Module):
         attn_drop=0.0,
         drop_path=0.0,
         act_layer=nn.GELU,
-        norm_layer=nn.LayerNorm,
+        norm_layer=MaskedLayerNorm,
     ):
         super().__init__()
 
         mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = MaskedDropPath(drop_path) if drop_path > 0.0 else Identity()
 
         # ATTENTION BLOCK
         self.norm1 = norm_layer(dim)
@@ -117,13 +125,14 @@ class Block(nn.Module):
             drop=drop,
         )
 
-    def forward(self, x, attn_mask=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _x, attn = self.attn(self.norm1(x), attn_mask)
-        x = x + self.drop_path(_x)
-        ffn = self.mlp(self.norm2(x))
-        x = x + self.drop_path(ffn)
+    def forward(self, x, attn_mask=None, embedding_mask=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _x, attn = self.attn(self.norm1(x, embedding_mask), attn_mask)
+        x = x + self.drop_path(_x, embedding_mask)
+        ffn = self.mlp(self.norm2(x, embedding_mask))
+        if embedding_mask is not None:
+            ffn = ffn * embedding_mask.unsqueeze(-1)
+        x = x + self.drop_path(ffn, embedding_mask)
         return x, attn, ffn
-
 
 @dataclass()
 class TransformerEncoderOutput:
@@ -191,10 +200,12 @@ class TransformerEncoder(nn.Module):
 
             # Create additive attention mask of shape (B, 1, 1, T)
             attn_mask = (
-                torch.zeros_like(embedding_mask, dtype=torch.float32, device=x.device)
-                .masked_fill_(~embedding_mask, -torch.inf)
-                .unsqueeze(1)
-                .unsqueeze(1)
+                embedding_mask.unsqueeze(1).unsqueeze(2) & embedding_mask.unsqueeze(1).unsqueeze(3)
+            )
+            attn_mask = (
+                (~attn_mask)
+                .type(torch.float32)
+                .masked_fill(~attn_mask, torch.finfo(torch.float32).min)
             )
         else:
             attn_mask = None
@@ -207,7 +218,7 @@ class TransformerEncoder(nn.Module):
         for block in self.blocks:
             if self.add_pos_at_every_layer:
                 x = x + pos
-            x, attn, ffn = block(x, attn_mask)
+            x, attn, ffn = block(x, attn_mask, embedding_mask)
             if return_hidden_states:
                 assert hidden_states is not None
                 hidden_states.append(x)

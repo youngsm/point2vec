@@ -10,11 +10,10 @@ from sklearn.svm import SVC
 from torch.utils.data import DataLoader
 
 from point2vec.modules.EMA import EMA
-from point2vec.modules.masking import PointcloudMasking, VariablePointcloudMasking
+from point2vec.modules.masking import PointcloudMasking, VariablePointcloudMasking, masked_layer_norm
 from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
-
 
 class Point2Vec(pl.LightningModule):
     def __init__(
@@ -276,8 +275,7 @@ class Point2Vec(pl.LightningModule):
             ).last_hidden_state  # (B, T, C)
             predictions = self.regressor(output_embeddings[masked])
 
-        targets = self.generate_targets(embeddings, pos, decoder_mask)[masked[decoder_mask]]
-
+        targets = self.generate_targets(embeddings, pos, decoder_mask)[masked]
         return predictions, targets
 
     def _perform_step(self, inputs: torch.Tensor, lengths: torch.Tensor, semantic_labels: torch.Tensor | None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -364,7 +362,7 @@ class Point2Vec(pl.LightningModule):
         self,
         tokens: torch.Tensor,
         pos: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.teacher.ema_model is not None  # always false
         self.teacher.ema_model.eval()
@@ -386,57 +384,55 @@ class Point2Vec(pl.LightningModule):
         else:
             raise ValueError()
         target_layers = [
-            target_layers[i][mask] for i in d2v_target_layers
+            target_layers[i] for i in d2v_target_layers
         ]  # [(B, T, C)]
-
         # pre norm
 
         target_layer_norm = self.hparams.d2v_target_layer_norm  # type: ignore
-        if target_layer_norm == "instance":
+        if target_layer_norm == 'masked_layer':
+            assert mask is not None
             target_layers = [
-                F.instance_norm(target.transpose(1, 2)).transpose(1, 2)
+                masked_layer_norm(target, target.shape[-1], mask)
                 for target in target_layers
             ]
-        elif target_layer_norm == "layer":
+        else:
+            assert mask is None
+
+        norm_functions = {
+            "instance": lambda target: F.instance_norm(target.transpose(1, 2)).transpose(1, 2),
+            "layer": lambda target: F.layer_norm(target, target.shape[-1:]),
+            "group": lambda target: F.layer_norm(target, target.shape[-2:]),
+            "batch": lambda target: F.batch_norm(target.transpose(1, 2),
+                running_mean=None,
+                running_var=None,
+                training=True,
+            ).transpose(1, 2),
+        }
+
+        if target_layer_norm in norm_functions:
             target_layers = [
-                F.layer_norm(target, target.shape[-1:]) for target in target_layers
-            ]
-        elif target_layer_norm == "group":
-            target_layers = [
-                F.layer_norm(target, target.shape[-2:]) for target in target_layers
-            ]
-        elif target_layer_norm == "batch":
-            target_layers = [
-                F.batch_norm(
-                    target.transpose(1, 2),
-                    running_mean=None,
-                    running_var=None,
-                    training=True,
-                ).transpose(1, 2)
+                norm_functions[target_layer_norm](target)
                 for target in target_layers
             ]
-        elif target_layer_norm is not None:
+        elif target_layer_norm is not None and target_layer_norm != "masked_layer":
             raise ValueError()
 
-        # Average top K blocks
+        # Average top K blocks; can do this even with padded tokens because
+        # masked_layer_norm zeros out padded tokens across each target
+        # layer and do not influence the average for other tokens
         targets = torch.stack(target_layers, dim=0).mean(0)  # (B, T, C)
 
         # post norm
         target_norm = self.hparams.d2v_target_norm  # type: ignore
-        if target_norm == "instance":
-            targets = F.instance_norm(targets.transpose(1, 2)).transpose(1, 2)
-        elif target_norm == "layer":
-            targets = F.layer_norm(targets, targets.shape[-1:])
-        elif target_norm == "group":
-            targets = F.layer_norm(targets, targets.shape[-2:])
-        elif target_norm == "batch":
-            targets = F.batch_norm(
-                targets.transpose(1, 2),
-                running_mean=None,
-                running_var=None,
-                training=True,
-            ).transpose(1, 2)
-        elif target_norm is not None:
+        if target_norm == 'masked_layer':
+            assert mask is not None
+            targets = masked_layer_norm(targets, targets.shape[-1], mask)
+        else:
+            assert mask is None
+
+        if target_norm in norm_functions:
+            targets = norm_functions[target_norm](targets)
+        elif target_norm is not None and target_norm != "masked_layer":
             raise ValueError()
 
         return targets

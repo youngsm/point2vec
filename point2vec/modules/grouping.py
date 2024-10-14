@@ -202,11 +202,14 @@ class PointcloudGrouping(nn.Module):
 
         # Gather semantic ids
         if semantic_id is not None:
-            semantic_id_groups = masked_gather(semantic_id, idx)  # (B, G, K)
+            semantic_id_groups = masked_gather(
+                    semantic_id, idx
+            )  # (B, G, K, 1)
             semantic_id_groups[idx.eq(-1)] = -1
-
-        # Gather points
+        # Create point mask with shape (B, G, K)
+        point_lengths = (~idx.eq(-1)).sum(2)  # (B, G)
         groups = masked_gather(points, fill_empty_indices(idx))  # (B, G, K, C)
+        point_mask = torch.arange(self.group_size, device=idx.device).expand(groups.size(0), self.context_length, -1) < point_lengths[:, :self.context_length].unsqueeze(-1)  # (B, G, K)
 
         # Create embedding mask (i.e. which groups/embeddings to ignore in transformer)
         B, G, K, C = groups.shape
@@ -216,8 +219,8 @@ class PointcloudGrouping(nn.Module):
         # Normalize group coordinates
         groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers.unsqueeze(2)
         if self.group_radius is not None:
-            groups = (
-                groups / self.group_radius
+            groups[:, :, :, :3] = (
+                groups[:, :, :, :3] / self.group_radius
             )  # proposed by PointNeXT to make relative coordinates less small
 
         # G (max groups) --> T (context length)
@@ -225,11 +228,12 @@ class PointcloudGrouping(nn.Module):
         group_centers = group_centers[:, :self.context_length] # (B, G, 3) --> (B, T, 3)
         embedding_mask = embedding_mask[:, :self.context_length] # (B, G) --> (B, T)
         if semantic_id_groups is not None:
-            semantic_id_groups = semantic_id_groups[:, :, :self.context_length] # (B, G, K) --> (B, T, K)
+            semantic_id_groups = semantic_id_groups[:, :self.context_length] # (B, G, K) --> (B, T, K)
 
         return (
             groups,
             group_centers,
             embedding_mask,
+            point_mask,
             semantic_id_groups,
         )  # (B, T, K, C), (B, T, 3), (B, T), (B, T, K)
