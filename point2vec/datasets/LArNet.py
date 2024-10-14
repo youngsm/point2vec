@@ -16,6 +16,7 @@ class LArNet(Dataset):
         data_path: str,
         emin: float = 1.0e-6,
         emax: float = 20.0,
+        energy_threshold: float = 0.13,
         normalize: bool = True,
         remove_low_energy_scatters: bool = False,
     ):
@@ -23,8 +24,11 @@ class LArNet(Dataset):
         self.h5_files = glob(data_path)
         self.emin = emin
         self.emax = emax
+        self.energy_threshold = energy_threshold
         self.normalize = normalize
         self.remove_low_energy_scatters = remove_low_energy_scatters
+
+        print(f"[DATASET] {self.emin=}, {self.emax=}, {self.energy_threshold=}, {self.normalize=}, {self.remove_low_energy_scatters=}")
 
         self.lengths = []
 
@@ -68,8 +72,12 @@ class LArNet(Dataset):
 
     def transform_energy(self, pc):
         """tranforms energy to logarithmic scale on [-1,1]"""
-        pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
-        return pc
+        energy_mask = None
+        if self.energy_threshold > 0.0:
+            energy_mask = pc[:, 3] > self.energy_threshold
+            self.emin = self.energy_threshold
+        # pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
+        return pc, energy_mask
 
     def __getitem__(self, idx):
         h5_idx = np.searchsorted(self.cumulative_lengths, idx, side="right")
@@ -88,7 +96,12 @@ class LArNet(Dataset):
         # Normalize
         if self.normalize:
             data = self.pc_norm(data)
-        data = self.transform_energy(data)
+        data, energy_mask = self.transform_energy(data)
+
+        if energy_mask is not None:
+            data = data[energy_mask]
+            data_semantic_id = data_semantic_id[energy_mask]
+
         data = torch.from_numpy(data).float()
         data_semantic_id = torch.from_numpy(data_semantic_id).unsqueeze(1).long()
         return data, data_semantic_id
@@ -132,15 +145,16 @@ class LArNetDataModule(pl.LightningDataModule):
         data_path: str = "/sdf/home/y/youngsam/data/dune/larnet/h5/DataAccessExamples/train/generic_v2*.h5",
         batch_size: int = 512,
         num_workers: int = 8,
+        dataset_kwargs: dict = {},
     ):
         super().__init__()
         self.save_hyperparameters()
         self.persistent_workers = True if num_workers > 0 else False
 
     def setup(self, stage: Optional[str] = None):
-        self.train_dataset = LArNet(self.hparams.data_path)
+        self.train_dataset = LArNet(self.hparams.data_path, **self.hparams.dataset_kwargs)
         test_dir = self.hparams.data_path.replace("train", "val")
-        self.test_dataset = LArNet(test_dir)
+        self.test_dataset = LArNet(test_dir, **self.hparams.dataset_kwargs)
 
     def train_dataloader(self):
         return DataLoader(
