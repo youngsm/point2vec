@@ -14,6 +14,8 @@ from point2vec.modules.masking import PointcloudMasking, VariablePointcloudMaski
 from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
+from profiling_decorator import profile
+
 
 class Point2Vec(pl.LightningModule):
     def __init__(
@@ -241,26 +243,23 @@ class Point2Vec(pl.LightningModule):
         # mask: (B, T)
         w_m = masked.unsqueeze(-1)
         w_u = unmasked.unsqueeze(-1)
+
         corrupted_embeddings = w_u * embeddings + w_m * self.mask_token
         pos = self.positional_encoding(centers)
         decoder_mask = w_m.bool().squeeze() | w_u.bool().squeeze()
         if self.hparams.decoder:  # type: ignore
             B, _, C = embeddings.shape
 
-            visible_embeddings = torch.zeros_like(corrupted_embeddings)
-            visible_embeddings[unmasked] = corrupted_embeddings[unmasked]
-
-            masked_embeddings = torch.zeros_like(corrupted_embeddings)
-            masked_embeddings[masked] = corrupted_embeddings[masked]
+            visible_embeddings = corrupted_embeddings * unmasked.unsqueeze(-1)
+            masked_embeddings = corrupted_embeddings * masked.unsqueeze(-1)
 
             output_embeddings = self.student(
                 visible_embeddings, pos, w_u.bool().squeeze()
             ).last_hidden_state # (B, T, C)
 
-            total_embeddings = torch.zeros_like(corrupted_embeddings)
-            total_embeddings[unmasked] = output_embeddings[unmasked]
-            total_embeddings[masked] = masked_embeddings[masked]
-
+            total_embeddings = (output_embeddings * unmasked.unsqueeze(-1)
+                                + masked_embeddings * masked.unsqueeze(-1)
+            )
             decoder_output_tokens = self.decoder(
                 total_embeddings, pos, decoder_mask
             ).last_hidden_state
@@ -290,9 +289,9 @@ class Point2Vec(pl.LightningModule):
         points = self.train_transformations(points)
         x, y = self._perform_step(points, lengths, semantic_labels)
         loss = self.loss_func(x, y)
-        self.log("train_loss", loss, on_epoch=True)
-        self.log("train_pred_std", self.token_std(x))  # should always be > 0.01
-        self.log("train_target_std", self.token_std(y))  # should always be > 0.1
+        self.log("train_loss", loss, on_epoch=True, sync_dist=True)
+        self.log("train_pred_std", self.token_std(x), sync_dist=True)  # should always be > 0.01
+        self.log("train_target_std", self.token_std(y), sync_dist=True)  # should always be > 0.1
         return loss
 
     def validation_step(
@@ -303,9 +302,9 @@ class Point2Vec(pl.LightningModule):
         points = self.val_transformations(points)
         x, y = self._perform_step(points, lengths, semantic_labels)
         loss = self.loss_func(x, y)
-        self.log("val_loss", loss)
-        self.log("val_pred_std", self.token_std(x))
-        self.log("val_target_std", self.token_std(y))
+        self.log("val_loss", loss, sync_dist=True)
+        self.log("val_pred_std", self.token_std(x), sync_dist=True)
+        self.log("val_target_std", self.token_std(y), sync_dist=True)
 
     def validation_epoch_end(
         self, outputs: List[Tuple[torch.Tensor, torch.Tensor]]
@@ -355,7 +354,7 @@ class Point2Vec(pl.LightningModule):
     def optimizer_step(self, *args, **kwargs) -> None:
         super().optimizer_step(*args, **kwargs)
         self.teacher.update()
-        self.log("ema_decay", self.teacher.get_current_decay())
+        self.log("ema_decay", self.teacher.get_current_decay(), sync_dist=True)
 
     @torch.no_grad()
     def generate_targets(
