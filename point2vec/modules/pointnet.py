@@ -198,12 +198,13 @@ class PointcloudTokenizer(nn.Module):
         else:
             raise ValueError(f"Unknown embedding type: {embedding_type}")
 
-    def forward(self,
-                points: torch.Tensor,
-                lengths: torch.Tensor,
-                semantic_id: torch.Tensor | None = None,
-                return_group: bool = False
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        points: torch.Tensor,
+        lengths: torch.Tensor,
+        semantic_id: torch.Tensor | None = None,
+        return_point_info: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # points: (B, N, num_channels)
         # lengths: (B,)
         group: torch.Tensor
@@ -217,7 +218,7 @@ class PointcloudTokenizer(nn.Module):
         tokens = self.embedding(group.reshape(B * G, S, C), point_mask.reshape(B * G, 1, S)).reshape(
             B, G, self.token_dim
         )  # (B, G, C')
-        if return_group:
-            return tokens, group_center, embedding_mask, semantic_id_groups, group
+        if return_point_info:
+            return tokens, group_center, embedding_mask, semantic_id_groups, group, point_mask
         else:
             return tokens, group_center, embedding_mask, semantic_id_groups

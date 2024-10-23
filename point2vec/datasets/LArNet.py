@@ -27,6 +27,7 @@ class LArNet(Dataset):
         self.energy_threshold = energy_threshold
         self.normalize = normalize
         self.remove_low_energy_scatters = remove_low_energy_scatters
+        self.initted = False
 
         print(f"[DATASET] {self.emin=}, {self.emax=}, {self.energy_threshold=}, {self.normalize=}, {self.remove_low_energy_scatters=}")
 
@@ -57,6 +58,7 @@ class LArNet(Dataset):
         for h5_file in self.h5_files:
             self.h5data.append(h5py.File(h5_file, mode="r", libver="latest", swmr=True))
         atexit.register(self.cleanup)
+        self.initted = True
 
     def pc_norm(self, pc):
         """pc: NxC, return NxC"""
@@ -76,11 +78,15 @@ class LArNet(Dataset):
         if self.energy_threshold > 0.0:
             energy_mask = pc[:, 3] > self.energy_threshold
             self.emin = self.energy_threshold
-        # pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
+        pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
         return pc, energy_mask
 
     def __getitem__(self, idx):
+        if not self.initted: # usually when num_workers == 0
+            self.h5py_worker_init()
+
         h5_idx = np.searchsorted(self.cumulative_lengths, idx, side="right")
+
         h5_file = self.h5data[h5_idx]
         idx = idx - self.cumulative_lengths[h5_idx]
         idx = self.indices[h5_idx][idx]
@@ -140,6 +146,7 @@ class LArNet(Dataset):
 
 
 class LArNetDataModule(pl.LightningDataModule):
+    _class_weights = None
     def __init__(
         self,
         data_path: str = "/sdf/home/y/youngsam/data/dune/larnet/h5/DataAccessExamples/train/generic_v2*.h5",
@@ -151,10 +158,29 @@ class LArNetDataModule(pl.LightningDataModule):
         self.save_hyperparameters()
         self.persistent_workers = True if num_workers > 0 else False
 
+        # from datasets/ShapeNetPart.py
+        self._category_to_seg_classes = {
+            "shower": [0],
+            "track": [1],
+            "michel": [2],
+            "delta": [3],
+            "low energy deposit": [4],
+        }
+        # inverse mapping
+
+        self._seg_class_to_category = {}
+        for cat in self._category_to_seg_classes.keys():
+            for cls in self._category_to_seg_classes[cat]:
+                self._seg_class_to_category[cls] = cat
+
     def setup(self, stage: Optional[str] = None):
         self.train_dataset = LArNet(self.hparams.data_path, **self.hparams.dataset_kwargs)
         test_dir = self.hparams.data_path.replace("train", "val")
         self.test_dataset = LArNet(test_dir, **self.hparams.dataset_kwargs)
+
+        if self.train_dataset.remove_low_energy_scatters:
+            self._category_to_seg_classes.pop("low energy deposit")
+            self._seg_class_to_category.pop(4)
 
     def train_dataloader(self):
         return DataLoader(
@@ -178,6 +204,22 @@ class LArNetDataModule(pl.LightningDataModule):
             worker_init_fn=LArNet.init_worker_fn,
         )
 
+    @property
+    def category_to_seg_classes(self):
+        return self._category_to_seg_classes
+
+    @property
+    def seg_class_to_category(self):
+        return self._seg_class_to_category
+
+    @property
+    def num_seg_classes(self):
+        return len(self._category_to_seg_classes)
+
+    @property
+    def class_weights(self):
+        class_counts = torch.tensor([13151438.0, 13294331.0, 204836.0, 598025.0])
+        return class_counts.sum() / class_counts
 
 def log_transform(x, xmax=1, eps=1e-7):
     y0 = np.log10(eps)

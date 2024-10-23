@@ -6,21 +6,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
-from torchmetrics import Accuracy
+from torchmetrics import Accuracy, Precision
 
 from point2vec.modules.feature_upsampling import PointNetFeatureUpsampling
-from point2vec.modules.pointnet import PointcloudTokenizer
+from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
+from point2vec.modules.masking import MaskedBatchNorm1d, masked_layer_norm
+from point2vec.modules.segmentation import SegmentationHead
 from point2vec.utils.checkpoint import extract_model_checkpoint
-
 
 class Point2VecPartSegmentation(pl.LightningModule):
     def __init__(
         self,
-        tokenizer_num_groups: int = 128,
+        num_channels: int = 3,
+        tokenizer_num_init_groups: int = 128,
+        tokenizer_context_length: int = 256,
         tokenizer_group_size: int = 32,
         tokenizer_group_radius: float | None = None,
+        tokenizer_upscale_group_size: int | None = None,
+        tokenizer_overlap_factor: float | None = None,
+        label_embedding_dim: int = 64,
         encoder_dim: int = 384,
         encoder_depth: int = 12,
         encoder_heads: int = 6,
@@ -28,6 +34,8 @@ class Point2VecPartSegmentation(pl.LightningModule):
         encoder_attention_dropout: float = 0,
         encoder_drop_path_rate: float = 0.2,
         encoder_add_pos_at_every_layer: bool = True,
+        position_encoder: Optional[str] = "nn",
+        embedding_type: Optional[str] = "mini",
         encoder_unfreeze_epoch: int = 0,
         seg_head_fetch_layers: List[int] = [3, 7, 11],
         seg_head_dim: int = 512,
@@ -54,8 +62,6 @@ class Point2VecPartSegmentation(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.train_acc = Accuracy()
-        self.val_acc = Accuracy()
 
         def build_transformation(name: str) -> transforms.Transform:
             if name == "scale":
@@ -87,17 +93,30 @@ class Point2VecPartSegmentation(pl.LightningModule):
         )
 
         self.tokenizer = PointcloudTokenizer(
-            num_groups=tokenizer_num_groups,
+            num_init_groups=tokenizer_num_init_groups,
+            context_length=tokenizer_context_length,
             group_size=tokenizer_group_size,
             group_radius=tokenizer_group_radius,
+            upscale_group_size=tokenizer_upscale_group_size,
+            overlap_factor=tokenizer_overlap_factor,
             token_dim=encoder_dim,
+            num_channels=num_channels,
+            embedding_type=embedding_type,
         )
 
-        self.positional_encoding = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-            nn.Linear(128, encoder_dim),
-        )
+        match position_encoder:
+            case "nn":
+                self.positional_encoding = nn.Sequential(
+                nn.Linear(3, 128),
+                nn.GELU(),
+                nn.Linear(128, encoder_dim),
+            )
+            case "sine":
+                self.positional_encoding = PositionEmbeddingCoordsSine(
+                3, encoder_dim, 1
+            )
+            case _:
+                raise ValueError(f"Unknown position encoder: {position_encoder}")
 
         dpr = [
             x.item() for x in torch.linspace(0, encoder_drop_path_rate, encoder_depth)
@@ -113,43 +132,44 @@ class Point2VecPartSegmentation(pl.LightningModule):
             add_pos_at_every_layer=encoder_add_pos_at_every_layer,
         )
 
-        self.loss_func = nn.NLLLoss()
 
     def setup(self, stage: Optional[str] = None) -> None:
-        self.num_classes: int = self.trainer.datamodule.num_classes  # type: ignore
+        self.num_classes: int = 0
+        if hasattr(self.trainer.datamodule, "num_classes"):
+            self.num_classes = self.trainer.datamodule.num_classes
         self.num_seg_classes: int = self.trainer.datamodule.num_seg_classes  # type: ignore
         self.category_to_seg_classes: Dict[str, List[int]] = self.trainer.datamodule.category_to_seg_classes  # type: ignore
         self.seg_class_to_category: Dict[int, str] = self.trainer.datamodule.seg_class_to_category  # type: ignore
 
-        label_embedding_dim = 64
-        self.label_embedding = nn.Sequential(
-            nn.Linear(self.num_classes, label_embedding_dim, bias=False),
-            nn.BatchNorm1d(label_embedding_dim),
-            nn.LeakyReLU(0.2),
+        self.label_embedding = None
+        if self.hparams.label_embedding_dim:
+            self.label_embedding = nn.Sequential(
+                nn.Linear(self.num_classes, self.hparams.label_embedding_dim, bias=False),
+                nn.BatchNorm1d(self.hparams.label_embedding_dim),
+                nn.LeakyReLU(0.2),
+            )
+
+        point_dim: int = self.hparams.num_channels  # type: ignore
+        upsampling_dim: int = self.hparams.encoder_dim  # type: ignore
+        self.upsampling = PointNetFeatureUpsampling(in_channel=upsampling_dim + point_dim, mlp=[upsampling_dim, upsampling_dim])  # type: ignore
+
+        self.seg_head = SegmentationHead(
+            self.hparams.encoder_dim,
+            self.hparams.label_embedding_dim, # event-wide label embedding -- 0 for larnet!
+            upsampling_dim,
+            self.hparams.seg_head_dim,
+            self.hparams.seg_head_dropout,
+            self.num_seg_classes,
         )
 
-        point_dim = 3
-        upsampling_dim = 384
-        self.upsampling = PointNetFeatureUpsampling(in_channel=self.hparams.encoder_dim + point_dim, mlp=[upsampling_dim, upsampling_dim])  # type: ignore
+        self.val_macc = Accuracy('multiclass', num_classes=self.num_seg_classes, average="macro")
+        self.train_macc = Accuracy('multiclass', num_classes=self.num_seg_classes, average="macro")
+        self.val_acc = Accuracy('multiclass', num_classes=self.num_seg_classes)
+        self.val_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro")
+        self.val_precision = Precision("multiclass", num_classes=self.num_seg_classes)
+        self.train_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro")
 
-        self.seg_head = nn.Sequential(
-            nn.Conv1d(
-                2 * self.hparams.encoder_dim + label_embedding_dim + upsampling_dim,  # type: ignore
-                self.hparams.seg_head_dim,  # type: ignore
-                1,
-                bias=False,
-            ),
-            nn.BatchNorm1d(self.hparams.seg_head_dim),  # type: ignore
-            nn.ReLU(),
-            nn.Dropout(self.hparams.seg_head_dropout),  # type: ignore
-            nn.Conv1d(self.hparams.seg_head_dim, self.hparams.seg_head_dim // 2, 1, bias=False),  # type: ignore
-            nn.BatchNorm1d(self.hparams.seg_head_dim // 2),  # type: ignore
-            nn.ReLU(),
-            # nn.Dropout(self.hparams.seg_head_dropout),
-            nn.Conv1d(self.hparams.seg_head_dim // 2, self.num_seg_classes, 1),  # type: ignore
-        )
-
-        self.val_macc = Accuracy(num_classes=self.num_seg_classes, average="macro")
+        self.loss_func = nn.NLLLoss(weight=self.trainer.datamodule.class_weights)
 
         if self.hparams.pretrained_ckpt_path is not None:  # type: ignore
             self.load_pretrained_checkpoint(self.hparams.pretrained_ckpt_path)  # type: ignore
@@ -158,86 +178,124 @@ class Point2VecPartSegmentation(pl.LightningModule):
 
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
+                self.wandb_logger = logger
                 logger.watch(self)
                 logger.experiment.define_metric("val_acc", summary="last,max")
                 logger.experiment.define_metric("val_macc", summary="last,max")
                 logger.experiment.define_metric("val_ins_miou", summary="last,max")
                 logger.experiment.define_metric("val_cat_miou", summary="last,max")
+                logger.experiment.define_metric("val_precision", summary="last,max")
+                logger.experiment.define_metric("val_mprecision", summary="last,max")
 
-    def forward(self, points: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+    def forward(self, points: torch.Tensor, lengths: torch.Tensor, label: Optional[torch.Tensor] = None, class_mask: slice | None = None) -> torch.Tensor:
         # points: (B, N, 3)
-        # label:  (B,)
+        # lengths: (B,)
+        # label:  (B, N, 1)
         B, N, C = points.shape
+        point_mask = torch.arange(lengths.max(), device=lengths.device).expand(
+            len(lengths), -1
+        ) < lengths.unsqueeze(-1)
 
         tokens: torch.Tensor
         centers: torch.Tensor
-        tokens, centers = self.tokenizer(points)  # (B, T, C), (B, T, 3)
+        embedding_mask: torch.Tensor
+        tokens, centers, embedding_mask, _ = self.tokenizer(points, lengths, None)
         pos_embeddings = self.positional_encoding(centers)
         output: TransformerEncoderOutput = self.encoder(
-            tokens, pos_embeddings, return_hidden_states=True
+            tokens, pos_embeddings, embedding_mask, return_hidden_states=True
         )
-        hidden_states = [F.layer_norm((output.hidden_states[i]), output.hidden_states[i].shape[-1:]) for i in self.hparams.seg_head_fetch_layers]  # type: ignore [(B, T, C)]
+
+        hidden_states = [
+            masked_layer_norm(output.hidden_states[i], output.hidden_states[i].shape[-1], embedding_mask)
+            for i in self.hparams.seg_head_fetch_layers]  # type: ignore [(B, T, C)]
         token_features = torch.stack(hidden_states, dim=0).mean(0)  # (B, T, C)
         token_features_max = token_features.max(dim=1).values  # (B, C)
         token_features_mean = token_features.mean(dim=1)  # (B, C)
 
-        label_embedding = self.label_embedding(self.categorical_label(label))  # (B, L)
-
+        # for larnet we do not have event-wide labels.
+        label_embedding = None
+        if self.hparams.label_embedding_dim:
+            label_embedding = self.label_embedding(self.categorical_label(label))  # (B, L)
+    
         global_feature = torch.cat(
-            [token_features_max, token_features_mean, label_embedding], dim=-1
+            [token_features_max, token_features_mean]
+            + ([label_embedding] if label_embedding is not None else []), dim=-1
         )  # (B, 2*C' + L)
 
-        x = self.upsampling(points, centers, points, token_features)  # (B, N, C)
+        batch_lengths = embedding_mask.sum(dim=1)
+        x = self.upsampling(
+            points,
+            centers,
+            points,
+            token_features,
+            lengths,
+            batch_lengths,
+            point_mask,
+        )  # (B, N, C)
         x = torch.cat(
             [x, global_feature.unsqueeze(-1).expand(-1, -1, N).transpose(1, 2)], dim=-1
-        )  # (B, N, C'); C' = 3*C + L
-        x = self.seg_head(x.transpose(1, 2)).transpose(1, 2)  # (B, N, cls)
+        )  # (B, N, C'); C' = 3*C (+ L if we cared about event-wide embeddings)
+        x = self.seg_head(x.transpose(1, 2), point_mask).transpose(1, 2)  # (B, N, cls)
+        if class_mask is not None:
+            x = x[..., class_mask]
         x = F.log_softmax(x, dim=-1)
-        return x
+        return x, point_mask
 
     def training_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
-        # points: (B, N, 3)
-        # seg_labels: (B, N)
-        # label: (B,)
-        points, seg_labels, label = batch
+        # points: (B, N_max, 3)
+        # lengths: (B,)
+        # seg_labels: (B, N_max, 1)
+        points, lengths, seg_labels = batch
+        seg_labels = seg_labels.squeeze(-1) # (B, N_max)
         points = self.train_transformations(points)
-        log_probablities = self.forward(points, label)
 
-        log_probablities = log_probablities.view(-1, self.num_seg_classes)
-        seg_labels = seg_labels.view(-1)
-        loss = self.loss_func(log_probablities, seg_labels)
+        # note: label here is event-wide class label, not per-point;
+        # for larnet we do not have per-event labels so we pass None.
+        log_probabilities, point_mask = self.forward(points, lengths, label=None)
+        log_probabilities = log_probabilities[point_mask] # (N', N_cls) (N' = sum(lengths))
+        seg_labels = seg_labels[point_mask] # (N')
+        loss = self.loss_func(log_probabilities, seg_labels)
+
         self.log("train_loss", loss, on_epoch=True)
-
-        pred = torch.max(log_probablities, dim=-1).indices
-        self.train_acc(pred, seg_labels)
-        self.log("train_acc", self.train_acc, on_epoch=True)
+        pred = torch.max(log_probabilities, dim=-1).indices
+        self.train_macc(pred, seg_labels)
+        self.log("train_macc", self.train_macc, on_epoch=True)
+        self.train_mprecision(pred, seg_labels)
+        self.log("train_mprecision", self.train_mprecision, on_epoch=True)
 
         return loss
 
     def validation_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
     ) -> Dict[str, List[torch.Tensor]]:
-        # points: (B, N, 3)
-        # seg_labels: (B, N)
-        # label: (B,)
-        points, seg_labels, label = batch
+        # points: (B, N_max, 3)
+        # lengths: (B,)
+        # seg_labels: (B, N_max, 1)
+        points, lengths, seg_labels = batch
+        seg_labels = seg_labels.squeeze(-1) # (B, N_max)
         points = self.val_transformations(points)
-        log_probablities = self.forward(points, label)
 
-        ious = self.compute_shape_ious(log_probablities, seg_labels)
-
-        log_probablities = log_probablities.view(-1, self.num_seg_classes)
-        seg_labels = seg_labels.view(-1)
-        loss = self.loss_func(log_probablities, seg_labels)
+        # note: label here is event-wide class label, not per-point;
+        # for larnet we do not have per-event labels so we pass None.
+        log_probabilities, point_mask = self.forward(points, lengths, label=None) # (B, N_max, N_cls)
+        ious = self.compute_shape_ious(log_probabilities, seg_labels, lengths)
+        log_probabilities = log_probabilities[point_mask]
+        seg_labels = seg_labels[point_mask]
+        loss = self.loss_func(log_probabilities, seg_labels)
         self.log("val_loss", loss)
 
-        pred = torch.max(log_probablities, dim=-1).indices
+        pred = torch.max(log_probabilities, dim=-1).indices
         self.val_acc(pred, seg_labels)
         self.log("val_acc", self.val_acc)
         self.val_macc(pred, seg_labels)
         self.log("val_macc", self.val_macc)
+
+        self.val_precision(pred, seg_labels)
+        self.log("val_precision", self.val_precision)
+        self.val_mprecision(pred, seg_labels)
+        self.log("val_mprecision", self.val_mprecision)
 
         return ious
 
@@ -264,40 +322,36 @@ class Point2VecPartSegmentation(pl.LightningModule):
             self.log(f"val_cat_miou_{cat}", cat_mious[cat])
 
     def compute_shape_ious(
-        self, log_probablities: torch.Tensor, seg_labels: torch.Tensor
+        self, log_probabilities: torch.Tensor, seg_labels: torch.Tensor, lengths: torch.Tensor
     ) -> Dict[str, List[torch.Tensor]]:
         # log_probablities: (B, N, 50) \in -inf..<0
-        # seg_labels:       (B, N) \in 0..<50
+        # seg_labels:       (B, N) \in 0..<N_cls
         # returns           { cat: (S, P) }
 
         shape_ious: Dict[str, List[torch.Tensor]] = {
             cat: [] for cat in self.category_to_seg_classes.keys()
         }
 
-        for i in range(log_probablities.shape[0]):
-            cat = self.seg_class_to_category[seg_labels[i, 0].item()]  # type: ignore
-            seg_classes = self.category_to_seg_classes[cat]
-            seg_preds = (
-                torch.argmax(
-                    log_probablities[i, :, self.category_to_seg_classes[cat]], dim=1
-                )
-                + seg_classes[0]
-            )  # (N,)
+        for i in range(log_probabilities.shape[0]):
+            curr_logprobs = log_probabilities[i][: lengths[i]]
+            curr_seg_labels = seg_labels[i][: lengths[i]]
+            # Since the batch only contains one class, get the correct prediction directly
+            seg_preds = torch.argmax(curr_logprobs, dim=1)  # (N,)
 
-            seg_class_iou = torch.empty(len(seg_classes))
-            for c in seg_classes:
-                if ((seg_labels[i] == c).sum() == 0) and (
+            # Initialize IoU for the single class
+            seg_class_iou = torch.empty(len(self.category_to_seg_classes.keys()))
+            for c in self.seg_class_to_category.keys():
+                if ((curr_seg_labels[i] == c).sum() == 0) and (
                     (seg_preds == c).sum() == 0
                 ):  # part is not present, no prediction as well
-                    seg_class_iou[c - seg_classes[0]] = 1.0
+                    seg_class_iou[c] = 1.0
                 else:
-                    intersection = ((seg_labels[i] == c) & (seg_preds == c)).sum()
-                    union = ((seg_labels[i] == c) | (seg_preds == c)).sum()
-                    seg_class_iou[c - seg_classes[0]] = intersection / union
-            shape_ious[cat].append(seg_class_iou.mean())
-
+                    intersection = ((curr_seg_labels[i] == c) & (seg_preds == c)).sum()
+                    union = ((curr_seg_labels[i] == c) | (seg_preds == c)).sum()
+                    seg_class_iou[c] = intersection / union
+                shape_ious[self.seg_class_to_category[c]].append(seg_class_iou[c])
         return shape_ious
-
+    
     def configure_optimizers(self):
         assert self.trainer is not None
 
@@ -329,6 +383,6 @@ class Point2VecPartSegmentation(pl.LightningModule):
             self.encoder.requires_grad_(True)
             print("Unfreeze encoder")
 
-    def categorical_label(self, label: torch.Tensor) -> torch.Tensor:
+    def categorical_label(self, num_classes: int, label: torch.Tensor) -> torch.Tensor:
         # label: (B,)
         return torch.eye(self.num_classes, device=label.device)[label]
