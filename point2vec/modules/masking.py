@@ -375,41 +375,49 @@ class MaskedBatchNorm1d(nn.Module):
         # mask: (B, 1, L)
         B, C, L = x.size()
 
-        # Expand mask to match x's dimensions
-        mask = mask.expand_as(x)  # (B, C, L)
+        # Ensure mask has the correct shape and type
+        # mask: (B, 1, L), dtype=torch.float32
+        mask = mask.float()
 
-        # Compute the total number of valid elements per channel
-        valid_elements = mask.sum(dim=(0, 2))  # (C,)
-        valid_elements = valid_elements.clamp(min=1)  # Avoid division by zero
+        # Compute the total number of valid elements (scalar)
+        valid_elements = mask.sum()  # Scalar
 
-        # Zero out padded values in x
-        x_masked = x * mask
+        # Avoid division by zero
+        valid_elements = valid_elements.clamp(min=1)
 
-        # Compute mean
-        mean = x_masked.sum(dim=(0, 2)) / valid_elements  # (C,)
+        # Compute the mean over valid elements
+        # Sum over batch and length dimensions
+        sum_x = (x * mask).sum(dim=(0, 2))  # Shape: (C,)
+        mean = sum_x / valid_elements  # Shape: (C,)
 
-        # Compute variance
-        diff = x_masked - mean[None, :, None]
-        diff_squared = diff * diff
-        var = (diff_squared * mask).sum(dim=(0, 2)) / valid_elements  # (C,)
+        # Center the inputs
+        x = x - mean.view(1, C, 1)
 
+        # Compute the variance over valid elements
+        var = ((x * mask) ** 2).sum(dim=(0, 2)) / valid_elements  # Shape: (C,)
+
+        # Update running statistics
         if self.training:
-            # Update running stats
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.detach()
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.detach()
+            with torch.no_grad():
+                momentum = self.momentum
+                self.running_mean = (1 - momentum) * self.running_mean + momentum * mean
+                self.running_var = (1 - momentum) * self.running_var + momentum * var
         else:
+            x = x + mean.view(1, C, 1)
             # Use running stats during evaluation
             mean = self.running_mean
             var = self.running_var
 
+            # Recompute x_centered with updated mean
+            x = x - mean.view(1, C, 1)
+
         # Normalize
-        x_normed = (x - mean.view(1, C, 1)) / torch.sqrt(var.view(1, C, 1) + self.eps)
+        x = (
+            x / torch.sqrt(var + self.eps).view(1, C, 1)
+        ) * mask  # Multiply by mask to zero out padded positions
 
         # Apply affine transformation if enabled
         if self.affine:
-            x_normed = x_normed * self.weight[None, :, None] + self.bias[None, :, None]
+            x = x * self.weight.view(1, C, 1) + self.bias.view(1, C, 1)
 
-        # Zero out padded positions again
-        x_normed = x_normed * mask
-
-        return x_normed
+        return x

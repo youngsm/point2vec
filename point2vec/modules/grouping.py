@@ -136,6 +136,8 @@ class PointcloudGrouping(nn.Module):
         self.overlap_factor = overlap_factor
         self.context_length = context_length
 
+    @torch.no_grad()
+    
     def forward(
         self,
         points: torch.Tensor,
@@ -150,7 +152,7 @@ class PointcloudGrouping(nn.Module):
             points[:, :, :3].float(),
             K=self.num_groups,
             lengths=lengths,
-            random_start_point=True,
+            random_start_point=False,
         )  # (B, G, 3)
 
         semantic_id_groups = None
@@ -224,6 +226,8 @@ class PointcloudGrouping(nn.Module):
             )  # proposed by PointNeXT to make relative coordinates less small
 
         # G (max groups) --> T (context length)
+        # we are implicitly assuming that the number of non-padded groups is less than the context length. if 
+        # this is not the case, some valid groups will be ignored, which is terrible. be careful!
         groups = groups[:, :self.context_length] # (B, G, K, C) --> (B, T, K, C)
         group_centers = group_centers[:, :self.context_length] # (B, G, 3) --> (B, T, 3)
         embedding_mask = embedding_mask[:, :self.context_length] # (B, G) --> (B, T)
