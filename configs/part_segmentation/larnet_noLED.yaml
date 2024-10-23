@@ -1,0 +1,62 @@
+# pytorch_lightning==1.7.2
+seed_everything: 0
+trainer:
+  sync_batchnorm: true
+  # gradient_clip_val: null
+  # gradient_clip_algorithm: null
+  max_epochs: 300
+  precision: 16
+model:
+  num_channels: 4
+  tokenizer_num_init_groups: 256 # culled to context length
+  tokenizer_context_length: 128
+  tokenizer_group_size: 512
+  tokenizer_upscale_group_size: 1024
+  tokenizer_group_radius: 0.03289473684210526 # 25 / 760
+  tokenizer_overlap_factor: 0.55
+  label_embedding_dim: 0
+  encoder_dim: 384
+  encoder_depth: 12
+  encoder_heads: 6
+  encoder_dropout: 0.0
+  encoder_attention_dropout: 0.0
+  encoder_drop_path_rate: 0.1
+  encoder_unfreeze_epoch: 0
+  encoder_add_pos_at_every_layer: true
+  position_encoder: nn
+  embedding_type: masked_mini
+  seg_head_fetch_layers:
+  - 3
+  - 7
+  - 11
+  seg_head_dim: 512
+  seg_head_dropout: 0.5
+  learning_rate: 5.0e-6
+  optimizer_adamw_weight_decay: 0.05
+  lr_scheduler_linear_warmup_epochs: 10
+  lr_scheduler_linear_warmup_start_lr: 5.0e-07
+  lr_scheduler_cosine_eta_min: 5.0e-07
+  pretrained_ckpt_path: null
+  train_transformations:
+  - "center"
+  - "rotate"
+  val_transformations:
+  - "center"
+  transformation_scale_min: 0.8
+  transformation_scale_max: 1.25
+  transformation_scale_symmetries: [0, 0, 0]
+  transformation_rotate_dims: [1]
+  transformation_rotate_degs: null
+  transformation_translate: 0.2
+  transformation_height_normalize_dim: 1
+data:
+  class_path: point2vec.datasets.LArNetDataModule
+  init_args:
+    data_path: /sdf/home/y/youngsam/data/dune/larnet/h5/DataAccessExamples/train_med/generic_v2*.h5
+    batch_size: 28
+    num_workers: 4
+    dataset_kwargs:
+      energy_threshold: 0.13
+      remove_low_energy_scatters: true
+      emin: 1.0e-6
+      emax: 20.0
