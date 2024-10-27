@@ -8,6 +8,7 @@ from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
 from torchmetrics import Accuracy, Precision
 
+from point2vec.modules.loss import SoftmaxFocalLoss, DiceLoss
 from point2vec.modules.feature_upsampling import PointNetFeatureUpsampling
 from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
@@ -36,6 +37,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         encoder_add_pos_at_every_layer: bool = True,
         position_encoder: Optional[str] = "nn",
         embedding_type: Optional[str] = "mini",
+        loss_func: str = "nll",
         encoder_unfreeze_epoch: int = 0,
         seg_head_fetch_layers: List[int] = [3, 7, 11],
         seg_head_dim: int = 512,
@@ -162,14 +164,22 @@ class Point2VecPartSegmentation(pl.LightningModule):
             self.num_seg_classes,
         )
 
-        self.val_macc = Accuracy('multiclass', num_classes=self.num_seg_classes, average="macro")
-        self.train_macc = Accuracy('multiclass', num_classes=self.num_seg_classes, average="macro")
-        self.val_acc = Accuracy('multiclass', num_classes=self.num_seg_classes)
-        self.val_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro")
-        self.val_precision = Precision("multiclass", num_classes=self.num_seg_classes)
-        self.train_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro")
+        self.val_macc = Accuracy('multiclass', num_classes=self.num_seg_classes, average="macro", ignore_index=-1)
+        self.train_macc = Accuracy('multiclass', num_classes=self.num_seg_classes, average="macro", ignore_index=-1)
+        self.val_acc = Accuracy('multiclass', num_classes=self.num_seg_classes, ignore_index=-1)
+        self.val_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro", ignore_index=-1)
+        self.val_precision = Precision("multiclass", num_classes=self.num_seg_classes, ignore_index=-1)
+        self.train_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro", ignore_index=-1)
 
-        self.loss_func = nn.NLLLoss(weight=self.trainer.datamodule.class_weights)
+        match self.hparams.loss_func:
+            case "nll":
+                self.loss_func = nn.NLLLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1)
+            case "fancy":
+                self.loss_func = SoftmaxFocalLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1, gamma=5)
+                # self.dice_loss = DiceLoss(ignore_index=-1)
+                # self.loss_func = lambda logits, labels: 20 * self.dice_loss(logits, labels) + self.focal_loss(logits, labels)
+            case _:
+                raise ValueError(f"Unknown loss function: {self.hparams.loss_func}")
 
         if self.hparams.pretrained_ckpt_path is not None:  # type: ignore
             self.load_pretrained_checkpoint(self.hparams.pretrained_ckpt_path)  # type: ignore
@@ -187,7 +197,12 @@ class Point2VecPartSegmentation(pl.LightningModule):
                 logger.experiment.define_metric("val_precision", summary="last,max")
                 logger.experiment.define_metric("val_mprecision", summary="last,max")
 
-    def forward(self, points: torch.Tensor, lengths: torch.Tensor, label: Optional[torch.Tensor] = None, class_mask: slice | None = None) -> torch.Tensor:
+    def forward(self,
+                points: torch.Tensor,
+                lengths: torch.Tensor,
+                label: Optional[torch.Tensor] = None,
+                class_mask: slice | None = None,
+                return_logits: bool = False) -> torch.Tensor:
         # points: (B, N, 3)
         # lengths: (B,)
         # label:  (B, N, 1)
@@ -238,7 +253,10 @@ class Point2VecPartSegmentation(pl.LightningModule):
         x = self.seg_head(x.transpose(1, 2), point_mask).transpose(1, 2)  # (B, N, cls)
         if class_mask is not None:
             x = x[..., class_mask]
-        x = F.log_softmax(x, dim=-1)
+
+        if not return_logits:
+            x = F.log_softmax(x, dim=-1)
+
         return x, point_mask
 
     def training_step(
@@ -246,23 +264,27 @@ class Point2VecPartSegmentation(pl.LightningModule):
     ) -> torch.Tensor:
         # points: (B, N_max, 3)
         # lengths: (B,)
-        # seg_labels: (B, N_max, 1)
-        points, lengths, seg_labels = batch
-        seg_labels = seg_labels.squeeze(-1) # (B, N_max)
+        # labels: (B, N_max, 1)
+        points, lengths, labels = batch
+        labels = labels.squeeze(-1) # (B, N_max)
         points = self.train_transformations(points)
 
         # note: label here is event-wide class label, not per-point;
         # for larnet we do not have per-event labels so we pass None.
-        log_probabilities, point_mask = self.forward(points, lengths, label=None)
-        log_probabilities = log_probabilities[point_mask] # (N', N_cls) (N' = sum(lengths))
-        seg_labels = seg_labels[point_mask] # (N')
-        loss = self.loss_func(log_probabilities, seg_labels)
+        outputs, point_mask = self.forward(
+            points, lengths, label=None, return_logits=self.hparams.loss_func == 'fancy'
+        )
+        loss = self.loss_func(outputs, labels)
 
         self.log("train_loss", loss, on_epoch=True)
-        pred = torch.max(log_probabilities, dim=-1).indices
-        self.train_macc(pred, seg_labels)
+
+        if self.hparams.loss_func == 'fancy': # logits are returned
+            outputs = outputs.log_softmax(dim=-1)
+
+        pred = torch.max(outputs, dim=-1).indices
+        self.train_macc(pred.view(-1), labels.view(-1))
         self.log("train_macc", self.train_macc, on_epoch=True)
-        self.train_mprecision(pred, seg_labels)
+        self.train_mprecision(pred.view(-1), labels.view(-1))
         self.log("train_mprecision", self.train_mprecision, on_epoch=True)
 
         return loss
@@ -273,28 +295,32 @@ class Point2VecPartSegmentation(pl.LightningModule):
         # points: (B, N_max, 3)
         # lengths: (B,)
         # seg_labels: (B, N_max, 1)
-        points, lengths, seg_labels = batch
-        seg_labels = seg_labels.squeeze(-1) # (B, N_max)
+        points, lengths, labels = batch
+        labels = labels.squeeze(-1) # (B, N_max)
         points = self.val_transformations(points)
 
         # note: label here is event-wide class label, not per-point;
         # for larnet we do not have per-event labels so we pass None.
-        log_probabilities, point_mask = self.forward(points, lengths, label=None) # (B, N_max, N_cls)
-        ious = self.compute_shape_ious(log_probabilities, seg_labels, lengths)
-        log_probabilities = log_probabilities[point_mask]
-        seg_labels = seg_labels[point_mask]
-        loss = self.loss_func(log_probabilities, seg_labels)
+        logprobs, point_mask = self.forward(points, lengths, label=None) # (B, N_max, N_cls)
+        ious = self.compute_shape_ious(logprobs, labels, lengths)
+        # logprobs = logprobs[point_mask]
+        # seg_labels = labels[point_mask]
+        loss = self.loss_func(logprobs, labels)
         self.log("val_loss", loss)
 
-        pred = torch.max(log_probabilities, dim=-1).indices
-        self.val_acc(pred, seg_labels)
+        pred = torch.max(logprobs, dim=-1).indices
+
+        pred = pred.view(-1)
+        labels = labels.view(-1)
+
+        self.val_acc(pred, labels)
         self.log("val_acc", self.val_acc)
-        self.val_macc(pred, seg_labels)
+        self.val_macc(pred, labels)
         self.log("val_macc", self.val_macc)
 
-        self.val_precision(pred, seg_labels)
+        self.val_precision(pred, labels)
         self.log("val_precision", self.val_precision)
-        self.val_mprecision(pred, seg_labels)
+        self.val_mprecision(pred, labels)
         self.log("val_mprecision", self.val_mprecision)
 
         return ious
@@ -322,10 +348,10 @@ class Point2VecPartSegmentation(pl.LightningModule):
             self.log(f"val_cat_miou_{cat}", cat_mious[cat])
 
     def compute_shape_ious(
-        self, log_probabilities: torch.Tensor, seg_labels: torch.Tensor, lengths: torch.Tensor
+        self, log_probabilities: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor
     ) -> Dict[str, List[torch.Tensor]]:
         # log_probablities: (B, N, 50) \in -inf..<0
-        # seg_labels:       (B, N) \in 0..<N_cls
+        # labels:       (B, N) \in 0..<N_cls
         # returns           { cat: (S, P) }
 
         shape_ious: Dict[str, List[torch.Tensor]] = {
@@ -334,7 +360,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
 
         for i in range(log_probabilities.shape[0]):
             curr_logprobs = log_probabilities[i][: lengths[i]]
-            curr_seg_labels = seg_labels[i][: lengths[i]]
+            curr_seg_labels = labels[i][: lengths[i]]
             # Since the batch only contains one class, get the correct prediction directly
             seg_preds = torch.argmax(curr_logprobs, dim=1)  # (N,)
 
@@ -382,6 +408,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         if self.trainer.current_epoch == self.hparams.encoder_unfreeze_epoch:  # type: ignore
             self.encoder.requires_grad_(True)
             print("Unfreeze encoder")
+        # self.trainer.model = torch.compile(self.trainer.model, mode='reduce-overhead')
 
     def categorical_label(self, num_classes: int, label: torch.Tensor) -> torch.Tensor:
         # label: (B,)
