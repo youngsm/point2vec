@@ -177,7 +177,7 @@ class TransformerEncoder(nn.Module):
         )
 
         # output norm
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = MaskedLayerNorm(embed_dim)
 
         self.add_pos_at_every_layer = add_pos_at_every_layer
 
@@ -228,5 +228,5 @@ class TransformerEncoder(nn.Module):
             if return_ffns:
                 assert ffns is not None
                 ffns.append(ffn)
-        x = self.norm(x)
+        x = self.norm(x, embedding_mask)
         return TransformerEncoderOutput(x, hidden_states, attentions, ffns)
