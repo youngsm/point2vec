@@ -19,6 +19,7 @@ class LArNet(Dataset):
         energy_threshold: float = 0.13,
         normalize: bool = True,
         remove_low_energy_scatters: bool = False,
+        maxlen: int = -1,
     ):
         self.data_path = data_path
         self.h5_files = glob(data_path)
@@ -27,21 +28,24 @@ class LArNet(Dataset):
         self.energy_threshold = energy_threshold
         self.normalize = normalize
         self.remove_low_energy_scatters = remove_low_energy_scatters
+        self.maxlen = maxlen
         self.initted = False
 
         print(f"[DATASET] {self.emin=}, {self.emax=}, {self.energy_threshold=}, {self.normalize=}, {self.remove_low_energy_scatters=}")
 
         self.lengths = []
 
-        print(f"[DATASET] Building index")
         self._build_index()
-        print(f"[DATASET] {len(self.h5_files)} files were loaded")
+        assert self.maxlen <= self.cumulative_lengths[-1], f"[DATASET] maxlen {self.maxlen} is larger than the total number of points {self.cumulative_lengths[-1]}"
         self.h5data = []
 
     def __len__(self):
+        if self.maxlen > 0:
+            return min(self.maxlen, self.cumulative_lengths[-1])
         return self.cumulative_lengths[-1]
 
     def _build_index(self):
+        print("[DATASET] Building index")
         self.cumulative_lengths = []
         indices = []
         for h5_file in self.h5_files:
@@ -51,6 +55,7 @@ class LArNet(Dataset):
         self.cumulative_lengths = np.cumsum(self.cumulative_lengths)
         self.indices = indices
         print(f"[DATASET] {self.cumulative_lengths[-1]} point clouds were loaded")
+        print(f"[DATASET] {len(self.h5_files)} files were loaded")
 
     def h5py_worker_init(self):
         print(f"[DATASET] Initializing h5py workers")
