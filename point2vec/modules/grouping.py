@@ -1,8 +1,10 @@
-from pytorch3d.ops import ball_query, knn_gather, knn_points, sample_farthest_points
+from pytorch3d.ops import ball_query, knn_points
 import torch
 from typing import Tuple
 import torch.nn as nn
 from cnms import cnms
+from pytorch3d import _C
+from typing import Optional, List, Union
 
 def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     """
@@ -65,27 +67,107 @@ def masked_gather(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     # selected_points[idx_expanded_mask] = 0.0
     return selected_points
 
+
+def sample_farthest_points(
+    points: torch.Tensor,
+    lengths: Optional[torch.Tensor] = None,
+    K: Union[int, List, torch.Tensor] = 50,
+    random_start_point: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Iterative farthest point sampling algorithm [1] to subsample a set of
+    K points from a given pointcloud. At each iteration, a point is selected
+    which has the largest nearest neighbor distance to any of the
+    already selected points.
+
+    Farthest point sampling provides more uniform coverage of the input
+    point cloud compared to uniform random sampling.
+
+    [1] Charles R. Qi et al, "PointNet++: Deep Hierarchical Feature Learning
+        on Point Sets in a Metric Space", NeurIPS 2017.
+
+    Args:
+        points: (N, P, D) array containing the batch of pointclouds
+        lengths: (N,) number of points in each pointcloud (to support heterogeneous
+            batches of pointclouds)
+        K: samples required in each sampled point cloud (this is typically << P). If
+            K is an int then the same number of samples are selected for each
+            pointcloud in the batch. If K is a tensor is should be length (N,)
+            giving the number of samples to select for each element in the batch
+        random_start_point: bool, if True, a random point is selected as the starting
+            point for iterative sampling.
+
+    Returns:
+        selected_points: (N, K, D), array of selected values from points. If the input
+            K is a tensor, then the shape will be (N, max(K), D), and padded with
+            0.0 for batch elements where k_i < max(K).
+        selected_indices: (N, K) array of selected indices. If the input
+            K is a tensor, then the shape will be (N, max(K), D), and padded with
+            -1 for batch elements where k_i < max(K).
+    """
+    N, P, D = points.shape
+    device = points.device
+
+    # Validate inputs
+    if lengths is None:
+        lengths = torch.full((N,), P, dtype=torch.int64, device=device)
+    else:
+        if lengths.shape != (N,):
+            raise ValueError("points and lengths must have same batch dimension.")
+        if lengths.max() > P:
+            raise ValueError("A value in lengths was too large.")
+
+    # TODO: support providing K as a ratio of the total number of points instead of as an int
+    if isinstance(K, int):
+        K = torch.full((N,), K, dtype=torch.int64, device=device)
+    elif isinstance(K, list):
+        K = torch.tensor(K, dtype=torch.int64, device=device)
+
+    if K.shape[0] != N:
+        raise ValueError("K and points must have the same batch dimension")
+
+    # Check dtypes are correct and convert if necessary
+    if not (points.dtype == torch.float32):
+        points = points.to(torch.float32)
+    if not (lengths.dtype == torch.int64):
+        lengths = lengths.to(torch.int64)
+    if not (K.dtype == torch.int64):
+        K = K.to(torch.int64)
+
+    # Generate the starting indices for sampling
+    start_idxs = torch.zeros_like(lengths)
+    if random_start_point:
+        for n in range(N):
+            # pyre-fixme[6]: For 1st param expected `int` but got `Tensor`.
+            start_idxs[n] = torch.randint(high=lengths[n], size=(1,)).item()
+
+    with torch.no_grad():
+        # pyre-fixme[16]: `pytorch3d_._C` has no attribute `sample_farthest_points`.
+        idx = _C.sample_farthest_points(points[:, :, :3], lengths, K, start_idxs)
+    sampled_points = masked_gather(points, idx)
+    return sampled_points, idx
+
+
 def select_topk_by_energy(
     points: torch.Tensor,
     idx: torch.Tensor,
-    K_new: int,
-    invalid_idx_mask: torch.Tensor,
+    K: int,
     energies_idx: int = 3,
 ) -> torch.Tensor:
     """
-    Select the top K_new indices based on energies for each group.
+    Select the top K indices based on energies for each group.
 
     Args:
         points: Tensor of shape (B, N, C) containing point cloud data.
         idx: Tensor of shape (B, G, K_original) containing indices from ball_query.
-        K_new: Desired number of top points to select per group.
-        invalid_idx_mask: Boolean tensor of shape (B, G, K_original), where True indicates invalid indices.
+        K: Desired number of top points to select per group.
         energies_idx: Index in `points` where the energy value is stored.
 
     Returns:
-        topk_idx: Tensor of shape (B, G, K_new) containing indices of the top K_new energies per group.
+        topk_idx: Tensor of shape (B, G, K) containing indices of the top K energies per group.
     """
     B, G, K_original = idx.shape
+    invalid_idx_mask = idx == -1
 
     # Clamp idx to handle negative indices for gathering
     idx_clamped = idx.clamp(min=0)  # Shape: (B, G, K_original)
@@ -106,17 +188,48 @@ def select_topk_by_energy(
     # Set energies of invalid indices to -infinity
     energies[invalid_idx_mask] = -float("inf")
 
-    # Select top K_new energies
-    topk_energies, topk_indices = energies.topk(K_new, dim=2)  # Shapes: (B, G, K_new)
+    # Select top K energies
+    topk_energies, topk_indices = energies.topk(K, dim=2)  # Shapes: (B, G, K)
 
     # Gather corresponding indices
-    topk_idx = torch.gather(idx, 2, topk_indices)  # Shape: (B, G, K_new)
+    topk_idx = torch.gather(idx, 2, topk_indices)  # Shape: (B, G, K)
 
     # Set invalid indices back to -1
-    mask_valid = topk_energies != -float("inf")  # Shape: (B, G, K_new)
+    mask_valid = topk_energies != -float("inf")  # Shape: (B, G, K)
     topk_idx[~mask_valid] = -1
 
     return topk_idx
+
+def select_topk_by_fps(points: torch.Tensor, idx: torch.Tensor, K: int) -> torch.Tensor:
+    """
+    Args:
+        points: Tensor of shape (B, N, C) containing point cloud data.
+        idx: Tensor of shape (B, G, K_original) containing indices from ball_query.
+        K: Desired number of points to select per group.
+    """
+    B, N, C = points.shape
+    B, G, K_original = idx.shape
+
+    # 1. index points by idx
+    points_grouped = masked_gather(points, idx)  # (B, G, K, C)
+    # 2. reshape points to (B*G, K, C)
+    points_grouped = points_grouped.view(B*G, K_original, C)  # (B*G, K, C)
+    # 3. run fps on the reshaped points
+    _, idx_fps = sample_farthest_points(
+        points_grouped,
+        lengths=(~idx.eq(-1)).sum(2).view(B*G),
+        K=K,
+    )  # (B*G, K)
+    # 4. reshape the fps indices back to to (B, G, K)
+    idx_fps = idx_fps.view(B, G, K)
+
+    invalid_idx_mask = idx_fps == -1
+    idx_fps = idx_fps.clamp(min=0)
+    idx_fps = torch.gather(idx, 2, idx_fps)
+    idx_fps[invalid_idx_mask] = -1
+
+    # 5. return the fps indices
+    return idx_fps
 
 class PointcloudGrouping(nn.Module):
     def __init__(
@@ -126,7 +239,9 @@ class PointcloudGrouping(nn.Module):
         group_radius: float,
         upscale_group_size: int = 512,
         overlap_factor: float = 0.7,
-        context_length: int = 256
+        context_length: int = 256,
+        reduction_method: str = "energy",  # energy or fps
+        use_relative_features: bool = False,
     ):
         super().__init__()
         self.num_groups = num_groups
@@ -135,9 +250,9 @@ class PointcloudGrouping(nn.Module):
         self.upscale_group_size = upscale_group_size
         self.overlap_factor = overlap_factor
         self.context_length = context_length
-
+        self.reduction_method = reduction_method
+        self.use_relative_features = use_relative_features
     @torch.no_grad()
-    
     def forward(
         self,
         points: torch.Tensor,
@@ -149,7 +264,7 @@ class PointcloudGrouping(nn.Module):
 
         # Sample farthest points using lengths
         group_centers, _ = sample_farthest_points(
-            points[:, :, :3].float(),
+            points,
             K=self.num_groups,
             lengths=lengths,
             random_start_point=False,
@@ -170,7 +285,7 @@ class PointcloudGrouping(nn.Module):
         if self.group_radius is None:
             # KNN
             _, idx, _ = knn_points(
-                group_centers.float(),
+                group_centers[:, :, :3].float(),
                 points[:, :, :3].float(),
                 lengths1=lengths1,
                 lengths2=lengths,
@@ -181,7 +296,7 @@ class PointcloudGrouping(nn.Module):
         else:
             # Ball query
             _, idx, _ = ball_query(
-                group_centers.float(),
+                group_centers[:, :, :3].float(),
                 points[:, :, :3].float(),
                 K=self.upscale_group_size,
                 radius=self.group_radius,
@@ -190,17 +305,20 @@ class PointcloudGrouping(nn.Module):
                 return_nn=False,
             )  # idx: (B, G, K_big)
 
-        # Create invalid index mask
-        invalid_idx_mask = idx == -1  # Shape: (B, G, K_original)
-
         # Energy-based selection (K_big --> K by taking top K energies)
-        idx = select_topk_by_energy(
-            points=points,
-            idx=idx,
-            K_new=self.group_size,
-            invalid_idx_mask=invalid_idx_mask,
-            energies_idx=3,  # Assuming energy is at index 3
-        )  # idx: (B, G, K)
+        if self.reduction_method == 'energy':
+            idx = select_topk_by_energy(
+                points=points,
+                idx=idx,
+                K=self.group_size,
+                energies_idx=3,  # Assuming energy is at index 3
+            )  # idx: (B, G, K)
+        elif self.reduction_method == 'fps':
+            idx = select_topk_by_fps(
+                points=points,
+                idx=idx,
+                K=self.group_size,
+            )  # idx: (B, G, K)
 
         # Gather semantic ids
         if semantic_id is not None:
@@ -208,6 +326,7 @@ class PointcloudGrouping(nn.Module):
                     semantic_id, idx
             )  # (B, G, K, 1)
             semantic_id_groups[idx.eq(-1)] = -1
+
         # Create point mask with shape (B, G, K)
         point_lengths = (~idx.eq(-1)).sum(2)  # (B, G)
         groups = masked_gather(points, fill_empty_indices(idx))  # (B, G, K, C)
@@ -219,7 +338,11 @@ class PointcloudGrouping(nn.Module):
         embedding_mask = torch.arange(G, device=points.device).repeat(B, 1) < group_lengths.unsqueeze(1)
 
         # Normalize group coordinates
-        groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers.unsqueeze(2)
+        if self.use_relative_features:
+            groups = groups - group_centers[:, :, None, :]
+        else:
+            groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers[:, :, None, :3]
+
         if self.group_radius is not None:
             groups[:, :, :, :3] = (
                 groups[:, :, :, :3] / self.group_radius

@@ -27,6 +27,7 @@ class Point2Vec(pl.LightningModule):
         tokenizer_group_radius: float | None = None,
         tokenizer_upscale_group_size: int | None = None,
         tokenizer_overlap_factor: float | None = None,
+        tokenizer_reduction_method: str = 'energy', # method to reduce upscale group size to group size
         d2v_masking_ratio: float = 0.65,
         d2v_masking_type: str = "rand",  # rand, block
         encoder_dim: int = 384,
@@ -36,6 +37,7 @@ class Point2Vec(pl.LightningModule):
         encoder_attention_dropout: float = 0.05,
         encoder_drop_path_rate: float = 0.25,
         encoder_add_pos_at_every_layer: bool = True,
+        use_relative_features: bool = False,
         decoder: bool = True,
         decoder_depth: int = 4,
         decoder_dropout: float = 0,
@@ -60,11 +62,11 @@ class Point2Vec(pl.LightningModule):
         train_transformations: List[str] = [
             # "subsample",
             # "scale",
-            "center",
+            # "center",
             # "unit_sphere",
             "rotate",
         ],  # subsample, scale, center, unit_sphere, rotate, translate, height_norm
-        val_transformations: List[str] = ["center"],
+        val_transformations: List[str] = [],
         transformation_subsample_points: int = 1024,
         transformation_scale_min: float = 0.8,
         transformation_scale_max: float = 1.2,
@@ -111,19 +113,20 @@ class Point2Vec(pl.LightningModule):
             [build_transformation(name) for name in val_transformations]
         )
 
-        match position_encoder:
-            case "nn":
-                self.positional_encoding = nn.Sequential(
+        self.positional_encoding = nn.Sequential(
                 nn.Linear(3, 128),
                 nn.GELU(),
                 nn.Linear(128, encoder_dim),
+        )
+        if use_relative_features:
+            assert num_channels > 3, "num_channels must be greater than 3 to use relative features"
+            self.feature_encoder = nn.Sequential(
+                nn.Linear(num_channels-3, 128),
+                nn.GELU(),
+                nn.Linear(128, encoder_dim),
             )
-            case "sine":
-                self.positional_encoding = PositionEmbeddingCoordsSine(
-                3, encoder_dim, 1
-            )
-            case _:
-                raise ValueError(f"Unknown position encoder: {position_encoder}")
+        else:
+            self.feature_encoder = None
 
         self.tokenizer = PointcloudTokenizer(
             num_init_groups=tokenizer_num_init_groups,
@@ -131,6 +134,7 @@ class Point2Vec(pl.LightningModule):
             group_size=tokenizer_group_size,
             group_radius=tokenizer_group_radius,
             upscale_group_size=tokenizer_upscale_group_size,
+            reduction_method=tokenizer_reduction_method,
             overlap_factor=tokenizer_overlap_factor,
             token_dim=encoder_dim,
             num_channels=num_channels,
@@ -231,6 +235,12 @@ class Point2Vec(pl.LightningModule):
             if isinstance(logger, WandbLogger):
                 logger.watch(self)
 
+    def center_encoding(self, centers: torch.Tensor) -> torch.Tensor:
+        pos =  self.positional_encoding(centers[:, :, :3])
+        if self.feature_encoder is not None:
+            pos = pos + self.feature_encoder(centers[:, :, 3:])
+        return pos
+
     def forward(
         self,
         embeddings: torch.Tensor,
@@ -239,13 +249,14 @@ class Point2Vec(pl.LightningModule):
         unmasked: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # tokens: (B, T, C)
-        # centers: (B, T, 3)
+        # centers: (B, T, C)
         # mask: (B, T)
         w_m = masked.unsqueeze(-1)
         w_u = unmasked.unsqueeze(-1)
 
         corrupted_embeddings = w_u * embeddings + w_m * self.mask_token
-        pos = self.positional_encoding(centers)
+        pos = self.center_encoding(centers)
+
         decoder_mask = w_m.bool().squeeze() | w_u.bool().squeeze()
         if self.hparams.decoder:  # type: ignore
             B, _, C = embeddings.shape
@@ -268,7 +279,6 @@ class Point2Vec(pl.LightningModule):
 
             predictions = self.regressor(masked_output_tokens)
         else:  # no decoder => like data2vec
-            pos = self.positional_encoding(centers)
             output_embeddings = self.student(
                 corrupted_embeddings, pos, decoder_mask
             ).last_hidden_state  # (B, T, C)

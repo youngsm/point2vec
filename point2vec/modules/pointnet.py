@@ -177,6 +177,8 @@ class PointcloudTokenizer(nn.Module):
         token_dim: int,
         num_channels: int,
         embedding_type: str = "mini",
+        reduction_method: str = 'energy',
+        use_relative_features: bool = False,
     ) -> None:
         super().__init__()
         self.token_dim = token_dim
@@ -187,6 +189,8 @@ class PointcloudTokenizer(nn.Module):
             upscale_group_size=upscale_group_size,
             overlap_factor=overlap_factor,
             context_length=context_length,
+            reduction_method=reduction_method,
+            use_relative_features=use_relative_features,
         )
 
         if embedding_type == "mini":

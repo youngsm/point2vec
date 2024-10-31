@@ -27,6 +27,8 @@ class Point2VecPartSegmentation(pl.LightningModule):
         tokenizer_group_radius: float | None = None,
         tokenizer_upscale_group_size: int | None = None,
         tokenizer_overlap_factor: float | None = None,
+        tokenizer_reduction_method: str = 'fps',
+        use_relative_features: bool = True,
         label_embedding_dim: int = 64,
         encoder_dim: int = 384,
         encoder_depth: int = 12,
@@ -104,21 +106,26 @@ class Point2VecPartSegmentation(pl.LightningModule):
             token_dim=encoder_dim,
             num_channels=num_channels,
             embedding_type=embedding_type,
+            reduction_method=tokenizer_reduction_method,
+            use_relative_features=use_relative_features,
         )
 
-        match position_encoder:
-            case "nn":
-                self.positional_encoding = nn.Sequential(
-                nn.Linear(3, 128),
+        self.positional_encoding = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.GELU(),
+            nn.Linear(128, encoder_dim),
+        )
+        if use_relative_features:
+            assert (
+                num_channels > 3
+            ), "num_channels must be greater than 3 to use relative features"
+            self.feature_encoder = nn.Sequential(
+                nn.Linear(num_channels - 3, 128),
                 nn.GELU(),
                 nn.Linear(128, encoder_dim),
             )
-            case "sine":
-                self.positional_encoding = PositionEmbeddingCoordsSine(
-                3, encoder_dim, 1
-            )
-            case _:
-                raise ValueError(f"Unknown position encoder: {position_encoder}")
+        else:
+            self.feature_encoder = None
 
         dpr = [
             x.item() for x in torch.linspace(0, encoder_drop_path_rate, encoder_depth)
@@ -175,7 +182,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
             case "nll":
                 self.loss_func = nn.NLLLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1)
             case "fancy":
-                self.loss_func = SoftmaxFocalLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1, gamma=5)
+                self.loss_func = SoftmaxFocalLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1, gamma=2)
                 # self.dice_loss = DiceLoss(ignore_index=-1)
                 # self.loss_func = lambda logits, labels: 20 * self.dice_loss(logits, labels) + self.focal_loss(logits, labels)
             case _:
@@ -197,6 +204,12 @@ class Point2VecPartSegmentation(pl.LightningModule):
                 logger.experiment.define_metric("val_precision", summary="last,max")
                 logger.experiment.define_metric("val_mprecision", summary="last,max")
 
+    def center_encoding(self, centers: torch.Tensor) -> torch.Tensor:
+        pos = self.positional_encoding(centers[:, :, :3])
+        if self.feature_encoder is not None:
+            pos = pos + self.feature_encoder(centers[:, :, 3:])
+        return pos
+
     def forward(self,
                 points: torch.Tensor,
                 lengths: torch.Tensor,
@@ -215,7 +228,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         centers: torch.Tensor
         embedding_mask: torch.Tensor
         tokens, centers, embedding_mask, _ = self.tokenizer(points, lengths, None)
-        pos_embeddings = self.positional_encoding(centers)
+        pos_embeddings = self.center_encoding(centers)
         output: TransformerEncoderOutput = self.encoder(
             tokens, pos_embeddings, embedding_mask, return_hidden_states=True
         )
@@ -240,7 +253,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         batch_lengths = embedding_mask.sum(dim=1)
         x = self.upsampling(
             points,
-            centers,
+            centers[:, :, :3],
             points,
             token_features,
             lengths,
