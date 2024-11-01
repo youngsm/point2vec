@@ -106,8 +106,9 @@ class LArNet(Dataset):
         endpoints = np.zeros((pc.shape[0], 6)) # (N, 6)
         i = 0
         for c in cluster_size:
-            p1p2 = compute_endpoints(pc[i : i + c, :3]) # (6,)
-            endpoints[i : i + c] = np.tile(p1p2, (c, 1)) # (N_C, 6)
+            if c > 1:
+                p1p2 = compute_endpoints(pc[i : i + c, :3]) # (6,)
+                endpoints[i : i + c] = np.tile(p1p2, (c, 1)) # (N_C, 6)
             i += c
         return endpoints
 
@@ -294,7 +295,7 @@ def compute_endpoints(points):
     # get primary direction via pca
     cov = np.cov(centered, rowvar=False)
     eval, evec = np.linalg.eig(cov)
-    dir = evec[:, np.argmax(eval)]
+    dir = evec[:, eval.argmax()]
 
     # project points onto primary direction to find endpoints
     projections = np.dot(centered, dir)
