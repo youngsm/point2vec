@@ -278,7 +278,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         # points: (B, N_max, 3)
         # lengths: (B,)
         # labels: (B, N_max, 1)
-        points, lengths, labels = batch
+        points, lengths, labels, _ = batch
         labels = labels.squeeze(-1) # (B, N_max)
         points = self.train_transformations(points)
 
@@ -308,7 +308,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         # points: (B, N_max, 3)
         # lengths: (B,)
         # seg_labels: (B, N_max, 1)
-        points, lengths, labels = batch
+        points, lengths, labels, _ = batch
         labels = labels.squeeze(-1) # (B, N_max)
         points = self.val_transformations(points)
 

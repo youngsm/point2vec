@@ -19,6 +19,7 @@ class LArNet(Dataset):
         energy_threshold: float = 0.13,
         normalize: bool = True,
         remove_low_energy_scatters: bool = False,
+        endpoints: bool = False,
         maxlen: int = -1,
     ):
         self.data_path = data_path
@@ -28,6 +29,7 @@ class LArNet(Dataset):
         self.energy_threshold = energy_threshold
         self.normalize = normalize
         self.remove_low_energy_scatters = remove_low_energy_scatters
+        self.endpoints = endpoints
         self.maxlen = maxlen
         self.initted = False
 
@@ -36,7 +38,6 @@ class LArNet(Dataset):
         self.lengths = []
 
         self._build_index()
-        assert self.maxlen <= self.cumulative_lengths[-1], f"[DATASET] maxlen {self.maxlen} is larger than the total number of points {self.cumulative_lengths[-1]}"
         self.h5data = []
 
     def __len__(self):
@@ -85,9 +86,33 @@ class LArNet(Dataset):
             self.emin = self.energy_threshold
         pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
         return pc, energy_mask
+    
+    def compute_endpoints(self, pc, cluster_id):
+        """compute endpoints for each cluster
+        
+        these act as labels for line segments corresponding to the start and end points of each particle.
+        if you want to train a model to predict these endpoints, you can use these as labels.
+
+        start and end points are unordered, with the expectation that the loss will be a chamfer distance,
+        which is symmetric to ordering.
+
+        pc: Nx4, where each point is (x,y,z,e)
+        cluster_id: N, where each point is the cluster id of the particle it belongs to. cluster ids should be in order,
+                    i.e. [0,0,0,1,1,2,3,3,3,...]
+
+        returns: Nx6, where each point is (x1,y1,z1,x2,y2,z2)
+        """
+        cluster_size = np.bincount(cluster_id) # (C,)
+        endpoints = np.zeros((pc.shape[0], 6)) # (N, 6)
+        i = 0
+        for c in cluster_size:
+            p1p2 = compute_endpoints(pc[i : i + c, :3]) # (6,)
+            endpoints[i : i + c] = np.tile(p1p2, (c, 1)) # (N_C, 6)
+            i += c
+        return endpoints
 
     def __getitem__(self, idx):
-        if not self.initted: # usually when num_workers == 0
+        if not self.initted:
             self.h5py_worker_init()
 
         h5_idx = np.searchsorted(self.cumulative_lengths, idx, side="right")
@@ -102,7 +127,9 @@ class LArNet(Dataset):
         if self.remove_low_energy_scatters:
             data = data[cluster_size[0] :]
             semantic_id, cluster_size = semantic_id[1:], cluster_size[1:]
+
         data_semantic_id = np.repeat(semantic_id, cluster_size)
+        cluster_id = np.repeat(np.arange(len(cluster_size)), cluster_size)
 
         # Normalize
         if self.normalize:
@@ -112,13 +139,21 @@ class LArNet(Dataset):
         if energy_mask is not None:
             data = data[energy_mask]
             data_semantic_id = data_semantic_id[energy_mask]
+            cluster_id = cluster_id[energy_mask]
+
+        # Compute endpoints if needed (for line detection)
+        endpoints = None
+        if self.endpoints:
+            endpoints = self.compute_endpoints(data, cluster_id)
+            endpoints = torch.from_numpy(endpoints).float()
 
         data = torch.from_numpy(data).float()
         data_semantic_id = torch.from_numpy(data_semantic_id).unsqueeze(1).long()
-        return data, data_semantic_id
+        return data, data_semantic_id, endpoints
 
     def __del__(self):
-        self.cleanup()
+        if self.initted:
+            self.cleanup()
 
     def cleanup(self):
         for h5_file in self.h5data:
@@ -135,6 +170,7 @@ class LArNet(Dataset):
     def collate_fn(batch):
         data = [item[0] for item in batch]
         semantic_id = [item[1] for item in batch]
+        endpoints = [item[2] for item in batch]
         lengths = torch.tensor(
             [points.size(0) for points in data], dtype=torch.long
         )  # Shape: (B,)
@@ -143,10 +179,16 @@ class LArNet(Dataset):
             semantic_id, batch_first=True, padding_value=-1
         )  # Shape: (B, N_max)
 
+        if endpoints[0] is not None:
+            padded_endpoints = pad_sequence(endpoints, batch_first=True) # Shape: (B, N_max, 6)
+        else:
+            padded_endpoints = None
+
         return (
             padded_points,
             lengths,
             padded_semantic_id,
+            padded_endpoints,
         )
 
 
@@ -223,40 +265,38 @@ class LArNetDataModule(pl.LightningDataModule):
 
     @property
     def class_weights(self):
+        """
+        inverse class weights, computed on validation set (~300 events),
+        in the same order as category_to_seg_classes
+        """
         class_counts = torch.tensor([13151438.0, 13294331.0, 204836.0, 598025.0])
         return class_counts.sum() / class_counts
 
 def log_transform(x, xmax=1, eps=1e-7):
+    # [eps, xmax] -> [-1,1]
     y0 = np.log10(eps)
     y1 = np.log10(eps + xmax)
     return 2 * (np.log10(x + eps) - y0) / (y1 - y0) - 1
 
 
 def inv_log_transform(x, xmax=1, eps=1e-7):
+    # [-1,1] -> [eps, xmax]
     y0 = np.log10(eps)
     y1 = np.log10(xmax + eps)
     x = (x + 1) / 2
     return 10 ** (x * (y1 - y0) + y0) - eps
 
+def compute_endpoints(points):
+    # get centroid
+    c = np.mean(points, axis=0)
+    centered = points - c
 
-def pad_with_first_point(batch):
-    # Step 1: Compute the maximum length
-    max_length = max(tensor.size(0) for tensor in batch)
+    # get primary direction via pca
+    cov = np.cov(centered, rowvar=False)
+    eval, evec = np.linalg.eig(cov)
+    dir = evec[:, np.argmax(eval)]
 
-    padded_tensors = []
-    for tensor in batch:
-        current_length = tensor.size(0)
-        pad_size = max_length - current_length
-
-        if pad_size > 0:
-            # Step 2: Create padding tensor by repeating the first point
-            pad_tensor = tensor[0].unsqueeze(0).expand(pad_size, -1)
-            # Step 3: Concatenate the original tensor with the padding tensor
-            padded_tensor = torch.cat([tensor, pad_tensor], dim=0)
-        else:
-            padded_tensor = tensor
-
-        padded_tensors.append(padded_tensor)
-
-    # Step 4: Stack all padded tensors
-    return torch.stack(padded_tensors, dim=0)
+    # project points onto primary direction to find endpoints
+    projections = np.dot(centered, dir)
+    p1, p2 = points[projections.argmin()], points[projections.argmax()]
+    return np.concatenate([p1, p2])

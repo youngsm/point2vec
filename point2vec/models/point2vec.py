@@ -295,7 +295,7 @@ class Point2Vec(pl.LightningModule):
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         # inputs: (B, N, num_channels)
-        points, lengths, semantic_labels = batch
+        points, lengths, semantic_labels, _ = batch
         points = self.train_transformations(points)
         x, y = self._perform_step(points, lengths, semantic_labels)
         loss = self.loss_func(x, y)
@@ -308,7 +308,7 @@ class Point2Vec(pl.LightningModule):
         self, batch, batch_idx: int
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         # inputs: (B, N, num_channels)
-        points, lengths, semantic_labels = batch
+        points, lengths, semantic_labels, _ = batch
         points = self.val_transformations(points)
         x, y = self._perform_step(points, lengths, semantic_labels)
         loss = self.loss_func(x, y)
