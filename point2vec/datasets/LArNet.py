@@ -317,10 +317,8 @@ def compute_endpoints(points: np.ndarray, semantic_id: int):
     semantic_id: int, the semantic id of the cluster
     """
 
-    # assume points are (x,y,z,e,t)
     points = points[points[:, -1].argsort()]
-    first_point = points[0, :3]
+    first_point, last_point = points[0, :3], points[-1, :3]
     if semantic_id == 0: # shower has only 1 end point
-        return np.concatenate([first_point[:3], first_point[:3]])
-
-    return np.concatenate([first_point, points[-1, :3]])
+        return np.concatenate([first_point, first_point])
+    return np.concatenate([first_point, last_point])
