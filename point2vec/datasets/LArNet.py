@@ -80,14 +80,14 @@ class LArNet(Dataset):
 
     def transform_energy(self, pc):
         """tranforms energy to logarithmic scale on [-1,1]"""
-        energy_mask = None
+        threshold_mask = None
         if self.energy_threshold > 0.0:
-            energy_mask = pc[:, 3] > self.energy_threshold
+            threshold_mask = pc[:, 3] > self.energy_threshold
             self.emin = self.energy_threshold
         pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
-        return pc, energy_mask
+        return pc, threshold_mask
     
-    def compute_endpoints(self, pc, cluster_id):
+    def compute_endpoints(self, pc, cluster_id, semantic_id):
         """compute endpoints for each cluster
         
         these act as labels for line segments corresponding to the start and end points of each particle.
@@ -99,6 +99,8 @@ class LArNet(Dataset):
         pc: Nx4, where each point is (x,y,z,e)
         cluster_id: N, where each point is the cluster id of the particle it belongs to. cluster ids should be in order,
                     i.e. [0,0,0,1,1,2,3,3,3,...]
+        semantic_id: N, where each point is the semantic id of the particle it belongs to.
+                    i.e. [0,0,0,1,1,2,3,3,3,...]. each cluster has the same semantic id.
 
         returns: Nx6, where each point is (x1,y1,z1,x2,y2,z2)
         """
@@ -107,7 +109,7 @@ class LArNet(Dataset):
         i = 0
         for c in cluster_size:
             if c > 1:
-                p1p2 = compute_endpoints(pc[i : i + c, :3]) # (6,)
+                p1p2 = compute_endpoints(pc[i : i + c], semantic_id[i]) # (6,)
                 endpoints[i : i + c] = np.tile(p1p2, (c, 1)) # (N_C, 6)
             i += c
         return endpoints
@@ -121,7 +123,7 @@ class LArNet(Dataset):
         h5_file = self.h5data[h5_idx]
         idx = idx - self.cumulative_lengths[h5_idx]
         idx = self.indices[h5_idx][idx]
-        data = h5_file["point"][idx].reshape(-1, 8)[:, :4]
+        data = h5_file["point"][idx].reshape(-1, 8)[:, [0,1,2,3,5]] # (x,y,z,e,t)
         cluster_size, semantic_id = h5_file["cluster"][idx].reshape(-1, 5)[:, [0, -1]].T
 
         # remove first particle from data, i.e. low energy scatters
@@ -135,22 +137,22 @@ class LArNet(Dataset):
         # Normalize
         if self.normalize:
             data = self.pc_norm(data)
-        data, energy_mask = self.transform_energy(data)
+        data, threshold_mask = self.transform_energy(data)
 
-        if energy_mask is not None:
-            data = data[energy_mask]
-            data_semantic_id = data_semantic_id[energy_mask]
-            cluster_id = cluster_id[energy_mask]
+        if threshold_mask is not None:
+            data = data[threshold_mask]
+            data_semantic_id = data_semantic_id[threshold_mask]
+            cluster_id = cluster_id[threshold_mask]
 
         # Compute endpoints if needed (for line detection)
         endpoints = None
         if self.endpoints:
-            endpoints = self.compute_endpoints(data, cluster_id)
+            endpoints = self.compute_endpoints(data, cluster_id, data_semantic_id)
             endpoints = torch.from_numpy(endpoints).float()
 
-        data = torch.from_numpy(data).float()
+        data = torch.from_numpy(data[:,:4]).float()
         data_semantic_id = torch.from_numpy(data_semantic_id).unsqueeze(1).long()
-        return data, data_semantic_id, endpoints
+        return data, data_semantic_id, endpoints # (N, 4), (N, 1), (N, 6)
 
     def __del__(self):
         if self.initted:
@@ -287,17 +289,38 @@ def inv_log_transform(x, xmax=1, eps=1e-7):
     x = (x + 1) / 2
     return 10 ** (x * (y1 - y0) + y0) - eps
 
-def compute_endpoints(points):
-    # get centroid
-    c = np.mean(points, axis=0)
-    centered = points - c
+# def compute_endpoints(points):
+#     # get centroid
+#     c = np.mean(points, axis=0)
+#     centered = points - c
 
-    # get primary direction via pca
-    cov = np.cov(centered, rowvar=False)
-    eval, evec = np.linalg.eig(cov)
-    dir = evec[:, eval.argmax()]
+#     # get primary direction via pca
+#     cov = np.cov(centered, rowvar=False)
+#     eval, evec = np.linalg.eig(cov)
+#     dir = evec[:, eval.argmax()]
 
-    # project points onto primary direction to find endpoints
-    projections = np.dot(centered, dir)
-    p1, p2 = points[projections.argmin()], points[projections.argmax()]
-    return np.concatenate([p1, p2])
+#     # project points onto primary direction to find endpoints
+#     projections = np.dot(centered, dir)
+#     p1, p2 = points[projections.argmin()], points[projections.argmax()]
+#     return np.concatenate([p1, p2])
+
+def compute_endpoints(points: np.ndarray, semantic_id: int):
+    """
+    compute endpoints for a cluster of points based on
+    the time ordering of those points. we take first and last
+    point in time as the endpoints.
+
+    if the cluster is a shower, we take the first point twice,
+    because there is no well-defined 'final point'.
+
+    points: Nx5, where each point is (x,y,z,e,t)
+    semantic_id: int, the semantic id of the cluster
+    """
+
+    # assume points are (x,y,z,e,t)
+    points = points[points[:, -1].argsort()]
+    first_point = points[0, :3]
+    if semantic_id == 0: # shower has only 1 end point
+        return np.concatenate([first_point[:3], first_point[:3]])
+
+    return np.concatenate([first_point, points[-1, :3]])
