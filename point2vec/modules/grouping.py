@@ -258,6 +258,7 @@ class PointcloudGrouping(nn.Module):
         points: torch.Tensor,
         lengths: torch.Tensor,
         semantic_id: torch.Tensor | None = None,
+        endpoints: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # points: (B, N, C)
         # lengths: (B,)
@@ -271,6 +272,7 @@ class PointcloudGrouping(nn.Module):
         )  # (B, G, 3)
 
         semantic_id_groups = None
+        endpoints_groups = None
 
         # Sphere culling
         if self.overlap_factor is not None:
@@ -327,6 +329,12 @@ class PointcloudGrouping(nn.Module):
             )  # (B, G, K, 1)
             semantic_id_groups[idx.eq(-1)] = -1
 
+        if endpoints is not None:
+            endpoints_groups = masked_gather(
+                endpoints, idx
+            )  # (B, G, K, 6)
+            endpoints_groups[idx.eq(-1)] = -1
+
         # Create point mask with shape (B, G, K)
         point_lengths = (~idx.eq(-1)).sum(2)  # (B, G)
         groups = masked_gather(points, fill_empty_indices(idx))  # (B, G, K, C)
@@ -356,6 +364,8 @@ class PointcloudGrouping(nn.Module):
         embedding_mask = embedding_mask[:, :self.context_length] # (B, G) --> (B, T)
         if semantic_id_groups is not None:
             semantic_id_groups = semantic_id_groups[:, :self.context_length] # (B, G, K) --> (B, T, K)
+        if endpoints_groups is not None:
+            endpoints_groups = endpoints_groups[:, :self.context_length] # (B, G, K, 6) --> (B, T, K, 6)
 
         return (
             groups,
@@ -363,4 +373,5 @@ class PointcloudGrouping(nn.Module):
             embedding_mask,
             point_mask,
             semantic_id_groups,
-        )  # (B, T, K, C), (B, T, 3), (B, T), (B, T, K)
+            endpoints_groups,
+        )  # (B, T, K, C), (B, T, 3), (B, T), (B, T, K), (B, T, K, 6)

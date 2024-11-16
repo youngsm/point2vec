@@ -6,57 +6,6 @@ import math
 from .grouping import PointcloudGrouping
 from .masking import MaskedBatchNorm1d
 
-class PositionEmbeddingCoordsSine(nn.Module):
-    """Similar to transformer's position encoding, but generalizes it to
-    arbitrary dimensions and continuous coordinates.
-
-    Args:
-        n_dim: Number of input dimensions, e.g. 2 for image coordinates.
-        d_model: Number of dimensions to encode into
-        temperature:
-        scale:
-    """
-
-    def __init__(
-        self, n_dim: int = 1, d_model: int = 256, temperature=10000, scale=None
-    ):
-        super().__init__()
-
-        self.n_dim = n_dim
-        self.num_pos_feats = d_model // n_dim // 2 * 2
-        self.temperature = temperature
-        self.padding = d_model - self.num_pos_feats * self.n_dim
-
-        if scale is None:
-            scale = 1.0
-        self.scale = scale * 2 * math.pi
-
-    def forward(self, xyz: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            xyz: Point positions (*, d_in)
-
-        Returns:
-            pos_emb (*, d_out)
-        """
-        assert xyz.shape[-1] == self.n_dim
-
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=xyz.device)
-        dim_t = self.temperature ** (
-            2 * torch.div(dim_t, 2, rounding_mode="trunc") / self.num_pos_feats
-        )
-
-        xyz = xyz * self.scale
-        pos_divided = xyz.unsqueeze(-1) / dim_t
-        pos_sin = pos_divided[..., 0::2].sin()
-        pos_cos = pos_divided[..., 1::2].cos()
-        pos_emb = torch.stack([pos_sin, pos_cos], dim=-1).reshape(*xyz.shape[:-1], -1)
-
-        # Pad unused dimensions with zeros
-        pos_emb = nn.functional.pad(pos_emb, (0, self.padding))
-        return pos_emb
-
-
 class MiniPointNet(nn.Module):
     def __init__(self, channels: int, feature_dim: int):
         super().__init__()
@@ -207,6 +156,7 @@ class PointcloudTokenizer(nn.Module):
         points: torch.Tensor,
         lengths: torch.Tensor,
         semantic_id: torch.Tensor | None = None,
+        endpoints: torch.Tensor | None = None,
         return_point_info: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # points: (B, N, num_channels)
@@ -217,12 +167,28 @@ class PointcloudTokenizer(nn.Module):
         lengths: torch.Tensor
         semantic_id_groups: torch.Tensor | None
 
-        group, group_center, embedding_mask, point_mask, semantic_id_groups = self.grouping(points, lengths, semantic_id)  # (B, G, K, C), (B, G, 3), (B, G, K)
+        (group, group_center, embedding_mask,
+        point_mask, semantic_id_groups, endpoints_groups) = self.grouping(
+            points, lengths, semantic_id, endpoints)  # (B, G, K, C), (B, G, 3), (B, G, K)
         B, G, S, C = group.shape
         tokens = self.embedding(group.reshape(B * G, S, C), point_mask.reshape(B * G, 1, S)).reshape(
             B, G, self.token_dim
         )  # (B, G, C')
         if return_point_info:
-            return tokens, group_center, embedding_mask, semantic_id_groups, group, point_mask
+            return (
+                tokens,
+                group_center,
+                embedding_mask,
+                semantic_id_groups,
+                endpoints_groups,
+                group,
+                point_mask,
+            )
         else:
-            return tokens, group_center, embedding_mask, semantic_id_groups
+            return (
+                tokens,
+                group_center,
+                embedding_mask,
+                semantic_id_groups,
+                endpoints_groups,
+            )

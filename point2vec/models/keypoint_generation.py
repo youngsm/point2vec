@@ -10,7 +10,7 @@ from torchmetrics import Accuracy, Precision
 
 from point2vec.modules.loss import SoftmaxFocalLoss, DiceLoss
 from point2vec.modules.feature_upsampling import PointNetFeatureUpsampling
-from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
+from point2vec.modules.pointnet import PointcloudTokenizer
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
 from point2vec.modules.masking import MaskedBatchNorm1d, masked_layer_norm

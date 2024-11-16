@@ -96,58 +96,15 @@ class VariablePointcloudMasking(nn.Module):
             self.forward = self._mask_center_rand
         elif type == "block":
             raise NotImplementedError('Block masking is not implemented for variable group masking')
-            self.forward = self._mask_center_block
         elif type == "fps":
             raise NotImplementedError('FPS masking is not implemented for variable group masking')
-            self.forward = self._mask_center_fps
         else:
             raise ValueError(f"No such masking type: {type}")
-
-    def _mask_center_fps(self, centers: torch.Tensor) -> torch.Tensor:
-        # centers: (B, G, 3)
-        if self.ratio == 0:
-            return torch.zeros(centers.shape[:2]).bool()
-
-        B, G, D = centers.shape
-        assert D == 3
-        num_mask = int(self.ratio * G)
-
-        _, idx = sample_farthest_points(
-            centers,
-            torch.full((B,), G, dtype=torch.int64),
-            K=num_mask,
-            random_start_point=True,
-        )
-
-        mask = torch.zeros(B, G, device=centers.device)
-        mask.scatter_(dim=1, index=idx, value=1.0)
-        mask = mask.to(torch.bool)
-        return mask
-
-    # def _mask_center_rand(
-    #     self, centers: torch.Tensor, lengths: torch.Tensor
-    # ) -> torch.Tensor:
-    #     # centers: (B, G, 3)
-    #     if self.ratio == 0:
-    #         return torch.zeros(centers.shape[:2]).bool()
-
-    #     B, G, _ = centers.shape
-
-    #     masked = torch.zeros(B, G, device=centers.device, dtype=torch.bool)
-    #     not_masked = torch.zeros(B, G, device=centers.device, dtype=torch.bool)
-
-    #     for i in range(B):
-    #         num_mask = (self.ratio * lengths[i]).int()
-    #         perm = torch.randperm(lengths[i], device=centers.device)
-    #         masked[i, perm[:num_mask]] = True
-    #         not_masked[i, perm[num_mask:]] = True
-
-    #     return masked, not_masked  # (B, G)
 
     def _mask_center_rand(
         self, centers: torch.Tensor, lengths: torch.Tensor
     ) -> torch.Tensor:
-        # centers: (B, G, 3)
+        # centers: (B, G, C)
         if self.ratio == 0:
             return torch.zeros(centers.shape[:2], device=centers.device, dtype=torch.bool)
 
@@ -188,33 +145,6 @@ class VariablePointcloudMasking(nn.Module):
         not_masked[batch_indices, sorted_indices] = (~mask) & valid_positions_mask
 
         return masked, not_masked  # (B, G)
-
-    def _mask_center_block(self, centers: torch.Tensor) -> torch.Tensor:
-        # centers: (B, G, 3)
-        if self.ratio == 0:
-            return torch.zeros(centers.shape[:2]).bool()
-
-        B, G, D = centers.shape
-        assert D == 3
-
-        num_mask = int(self.ratio * G)
-
-        # random center
-        center = torch.empty((B, 1, D), device=centers.device)
-        for i in range(B):
-            center[i, 0, :] = centers[i, torch.randint(0, G, (1,)), :]
-
-        # center's nearest neighbors
-        _, knn_idx, _ = knn_points(
-            center.float(), centers.float(), K=num_mask, return_sorted=False
-        )  # (B, 1, K)
-        knn_idx = knn_idx.squeeze(1)  # (B, K)
-
-        mask = torch.zeros([B, G], device=centers.device)
-        mask.scatter_(dim=1, index=knn_idx, value=1.0)
-        mask = mask.to(torch.bool)
-        return mask
-
 
 # https://github.com/allenai/allennlp/blob/main/allennlp/modules/masked_layer_norm.py
 class MaskedLayerNorm(torch.nn.Module):
@@ -351,24 +281,45 @@ class MaskedDropPath(nn.Module):
         return f'drop_prob={round(self.drop_prob,3):0.3f}'
 
 class MaskedBatchNorm1d(nn.Module):
-    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+    def __init__(
+            self,
+            num_features,
+            eps=1e-5,
+            momentum=0.1,
+            affine=True,
+            device=None,
+            dtype=None,
+    ):
+        factory_kwargs = {'device': device, 'dtype': dtype}
         super(MaskedBatchNorm1d, self).__init__()
         self.num_features = num_features
         self.affine = affine
 
         if self.affine:
-            self.weight = nn.Parameter(torch.ones(num_features))  # Gamma
-            self.bias = nn.Parameter(torch.zeros(num_features))   # Beta
+            self.weight = nn.Parameter(torch.ones(num_features, **factory_kwargs))  # Gamma
+            self.bias = nn.Parameter(torch.zeros(num_features, **factory_kwargs))  # Beta
         else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
 
         self.eps = eps
         self.momentum = momentum
 
         # Running stats
-        self.register_buffer('running_mean', torch.zeros(num_features))
-        self.register_buffer('running_var', torch.ones(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features, **factory_kwargs))
+        self.register_buffer("running_var", torch.ones(num_features, **factory_kwargs))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.reset_running_stats()
+        if self.affine:
+            nn.init.ones_(self.weight)
+            nn.init.zeros_(self.bias)
+
+    def reset_running_stats(self):
+        self.running_mean.zero_()
+        self.running_var.fill_(1)
 
     def forward(self, x, mask):
         # x: (B, C, L)

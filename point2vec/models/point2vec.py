@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from point2vec.modules.EMA import EMA
 from point2vec.modules.masking import PointcloudMasking, VariablePointcloudMasking, masked_layer_norm
-from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
+from point2vec.modules.pointnet import PointcloudTokenizer
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
 from profiling_decorator import profile
@@ -289,7 +289,7 @@ class Point2Vec(pl.LightningModule):
 
     def _perform_step(self, inputs: torch.Tensor, lengths: torch.Tensor, semantic_labels: torch.Tensor | None) -> Tuple[torch.Tensor, torch.Tensor]:
         # inputs: (B, N, num_channels)
-        tokens, centers, mask, _ = self.tokenizer(inputs, lengths, semantic_labels)  # (B, T, C), (B, T, 3)
+        tokens, centers, mask, _, _ = self.tokenizer(inputs, lengths, semantic_labels)  # (B, T, C), (B, T, 3)
         masked, unmasked = self.masking(centers, mask.sum(-1))  # (B, T), (B, T)
         return self.forward(tokens, centers, masked, unmasked)
 
@@ -339,7 +339,7 @@ class Point2Vec(pl.LightningModule):
                 points: torch.Tensor = points.cuda()
                 label: torch.Tensor = label.cuda()
                 points = self.val_transformations(points)
-                embeddings, centers, _ = self.tokenizer(points)
+                embeddings, centers, _, _ = self.tokenizer(points)
                 pos = self.positional_encoding(centers)
                 x = self.student(embeddings, pos).last_hidden_state
                 x = torch.cat([x.max(dim=1).values, x.mean(dim=1)], dim=-1)
