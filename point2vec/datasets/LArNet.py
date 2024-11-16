@@ -1,15 +1,15 @@
 import os
 import torch
 import numpy as np
-import atexit
+# import atexit
 import h5py
 from glob import glob
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 from typing import Optional
 from torch.nn.utils.rnn import pad_sequence
-
-
+import warnings
+from sklearn.cluster import DBSCAN
 class LArNet(Dataset):
     def __init__(
         self,
@@ -19,8 +19,9 @@ class LArNet(Dataset):
         energy_threshold: float = 0.13,
         normalize: bool = True,
         remove_low_energy_scatters: bool = False,
-        endpoints: bool = False,
+        endpoints: str | None = 'per-point', # 'per-point' or 'unique'
         maxlen: int = -1,
+        dbscan_eps: float = 1.99,
     ):
         self.data_path = data_path
         self.h5_files = glob(data_path)
@@ -29,7 +30,20 @@ class LArNet(Dataset):
         self.energy_threshold = energy_threshold
         self.normalize = normalize
         self.remove_low_energy_scatters = remove_low_energy_scatters
-        self.endpoints = endpoints
+        self.dbscan_eps = dbscan_eps
+        
+        if isinstance(endpoints, str):
+            match endpoints:
+                case 'unique':
+                    def endpoint_fn(pc, cluster_id, semantic_id):
+                        return get_unique_endpoints(pc, cluster_id, semantic_id, eps=self.dbscan_eps)
+
+                    self.endpoint_fn = endpoint_fn
+                case 'per-point':
+                    self.endpoint_fn = get_per_point_endpoints
+                case _:
+                    raise ValueError(f"endpoints must be 'unique' or 'per-point', got {endpoints}")
+                
         self.maxlen = maxlen
         self.initted = False
 
@@ -59,11 +73,11 @@ class LArNet(Dataset):
         print(f"[DATASET] {len(self.h5_files)} files were loaded")
 
     def h5py_worker_init(self):
-        print(f"[DATASET] Initializing h5py workers")
+        print(f"[DATASET] Initializing worker")
         self.h5data = []
         for h5_file in self.h5_files:
             self.h5data.append(h5py.File(h5_file, mode="r", libver="latest", swmr=True))
-        atexit.register(self.cleanup)
+        # atexit.register(self.cleanup)
         self.initted = True
 
     def pc_norm(self, pc):
@@ -74,7 +88,7 @@ class LArNet(Dataset):
         # m = np.max(np.sqrt(np.sum(pc**2, axis=1)))        # max distance between points
         m = (
             760.0 * np.sqrt(3) / 2
-        )  # Diagonal size is 760*sqrt(3), so max distance is sqrt(3)*760/2
+        )  # Diagonal size is 760*sqrt(3), so max distance from center is sqrt(3)*760/2
         pc[:, :3] = pc[:, :3] / m
         return pc
 
@@ -87,58 +101,34 @@ class LArNet(Dataset):
         pc[:, 3] = log_transform(pc[:, 3], self.emax, self.emin)
         return pc, threshold_mask
     
-    def compute_endpoints(self, pc, cluster_id, semantic_id):
-        """compute endpoints for each cluster
-        
-        these act as labels for line segments corresponding to the start and end points of each particle.
-        if you want to train a model to predict these endpoints, you can use these as labels.
-
-        start and end points are unordered, with the expectation that the loss will be a chamfer distance,
-        which is symmetric to ordering.
-
-        pc: Nx4, where each point is (x,y,z,e)
-        cluster_id: N, where each point is the cluster id of the particle it belongs to. cluster ids should be in order,
-                    i.e. [0,0,0,1,1,2,3,3,3,...]
-        semantic_id: N, where each point is the semantic id of the particle it belongs to.
-                    i.e. [0,0,0,1,1,2,3,3,3,...]. each cluster has the same semantic id.
-
-        returns: Nx6, where each point is (x1,y1,z1,x2,y2,z2)
-        """
-        cluster_size = np.bincount(cluster_id) # (C,)
-        endpoints = np.zeros((pc.shape[0], 6)) # (N, 6)
-        i = 0
-        for c in cluster_size:
-            if c > 1:
-                p1p2 = compute_endpoints(pc[i : i + c], semantic_id[i]) # (6,)
-                endpoints[i : i + c] = np.tile(p1p2, (c, 1)) # (N_C, 6)
-            i += c
-        return endpoints
-
     def __getitem__(self, idx):
         if not self.initted:
             self.h5py_worker_init()
 
+        # find which h5 file and index of the file the point cloud is in
         h5_idx = np.searchsorted(self.cumulative_lengths, idx, side="right")
-
         h5_file = self.h5data[h5_idx]
         idx = idx - self.cumulative_lengths[h5_idx]
         idx = self.indices[h5_idx][idx]
+
+        # load the point cloud
         data = h5_file["point"][idx].reshape(-1, 8)[:, [0,1,2,3,5]] # (x,y,z,e,t)
         cluster_size, semantic_id = h5_file["cluster"][idx].reshape(-1, 5)[:, [0, -1]].T
 
-        # remove first particle from data, i.e. low energy scatters
+        # remove low energy scatters (always first particle)
         if self.remove_low_energy_scatters:
             data = data[cluster_size[0] :]
             semantic_id, cluster_size = semantic_id[1:], cluster_size[1:]
 
+        # compute semantic and instance (cluster) ids for each point
         data_semantic_id = np.repeat(semantic_id, cluster_size)
         cluster_id = np.repeat(np.arange(len(cluster_size)), cluster_size)
 
-        # Normalize
-        if self.normalize:
-            data = self.pc_norm(data)
+
+        # log transform energy to [-1,1]
         data, threshold_mask = self.transform_energy(data)
 
+        # remove points below specified energy threshold
         if threshold_mask is not None:
             data = data[threshold_mask]
             data_semantic_id = data_semantic_id[threshold_mask]
@@ -146,9 +136,15 @@ class LArNet(Dataset):
 
         # Compute endpoints if needed (for line detection)
         endpoints = None
-        if self.endpoints:
-            endpoints = self.compute_endpoints(data, cluster_id, data_semantic_id)
+        if hasattr(self, 'endpoint_fn'):
+            endpoints = self.endpoint_fn(data, cluster_id, data_semantic_id)
             endpoints = torch.from_numpy(endpoints).float()
+
+        # normalize the point cloud to [-1,1]^3
+        if self.normalize:
+            data = self.pc_norm(data)
+            if endpoints is not None:
+                endpoints = self.pc_norm(endpoints)
 
         data = torch.from_numpy(data[:,:4]).float()
         data_semantic_id = torch.from_numpy(data_semantic_id).unsqueeze(1).long()
@@ -156,11 +152,8 @@ class LArNet(Dataset):
 
     def __del__(self):
         if self.initted:
-            self.cleanup()
-
-    def cleanup(self):
-        for h5_file in self.h5data:
-            h5_file.close()
+            for h5_file in self.h5data:
+                h5_file.close()
 
     @staticmethod
     def init_worker_fn(worker_id):
@@ -182,10 +175,9 @@ class LArNet(Dataset):
             semantic_id, batch_first=True, padding_value=-1
         )  # Shape: (B, N_max)
 
+        padded_endpoints = None
         if endpoints[0] is not None:
-            padded_endpoints = pad_sequence(endpoints, batch_first=True) # Shape: (B, N_max, 6)
-        else:
-            padded_endpoints = None
+            padded_endpoints = pad_sequence(endpoints, batch_first=True) # Shape: (B, N_max, 6) or (B, U_max, 3)
 
         return (
             padded_points,
@@ -289,20 +281,6 @@ def inv_log_transform(x, xmax=1, eps=1e-7):
     x = (x + 1) / 2
     return 10 ** (x * (y1 - y0) + y0) - eps
 
-# def compute_endpoints(points):
-#     # get centroid
-#     c = np.mean(points, axis=0)
-#     centered = points - c
-
-#     # get primary direction via pca
-#     cov = np.cov(centered, rowvar=False)
-#     eval, evec = np.linalg.eig(cov)
-#     dir = evec[:, eval.argmax()]
-
-#     # project points onto primary direction to find endpoints
-#     projections = np.dot(centered, dir)
-#     p1, p2 = points[projections.argmin()], points[projections.argmax()]
-#     return np.concatenate([p1, p2])
 
 def compute_endpoints(points: np.ndarray, semantic_id: int):
     """
@@ -322,3 +300,98 @@ def compute_endpoints(points: np.ndarray, semantic_id: int):
     if semantic_id == 0: # shower has only 1 end point
         return np.concatenate([first_point, first_point])
     return np.concatenate([first_point, last_point])
+
+def cluster_pc(pc, eps=1.99):
+    """
+    given a point cloud, cluster the points using DBSCAN and return
+    the centroids and counts of each cluster.
+
+    pc: NxC, where each point is (x,y,z,...)
+    eps: float, the epsilon parameter for DBSCAN
+
+    returns: (N', C+1), where each row is (x_centroid,y_centroid,z_centroid,...,count)
+    """
+
+    # Apply DBSCAN clustering
+    clustering = DBSCAN(eps=eps, min_samples=1).fit(pc)
+    labels = clustering.labels_
+
+    unique_labels = set(labels)
+    centroids_counts = []
+
+    for label in unique_labels:
+        cluster_points = pc[labels == label]
+        centroid = cluster_points.mean(axis=0)
+        count = len(cluster_points)
+        centroids_counts.append(np.append(centroid, count))
+
+    return np.array(centroids_counts)
+
+
+def get_unique_endpoints(
+    pc: np.ndarray, cluster_id: np.ndarray, semantic_id: np.ndarray, eps=1.99
+):
+    """
+    compute all endpoints for all clusters in a single pointcloud event 
+    and return them as a single array.
+
+    pc: Nx5, where each point is (x,y,z,e,t)
+    cluster_id: N, where each point is the cluster id of the particle it belongs to.
+                cluster ids should be in order, i.e. [0,0,0,1,1,2,3,3,3,...]
+    semantic_id: N, where each point is the semantic id of the particle it belongs to.
+                i.e. [0,0,0,1,1,2,3,3,3,...]. each cluster has the same semantic id.
+
+    """
+    cluster_size = np.bincount(cluster_id)  # (C,)
+    unique_endpoints = np.zeros((2 * len(cluster_size), 3))
+    ep_idx, pc_idx = 0, 0
+    for c in cluster_size:
+        if c <= 1:
+            continue
+        p1p2 = compute_endpoints(
+            pc[pc_idx : pc_idx + c], semantic_id[pc_idx]
+        )  # (6,) = (x1,y1,z1,x2,y2,z2)
+
+        if semantic_id[pc_idx] == 0:  # shower has only 1 end point (temporal start)
+            unique_endpoints[ep_idx] = p1p2[:3]
+            ep_idx += 1
+        else:
+            unique_endpoints[ep_idx] = p1p2[:3]
+            unique_endpoints[ep_idx + 1] = p1p2[3:]
+            ep_idx += 2
+        pc_idx += c
+
+    unique_endpoints = unique_endpoints[:ep_idx]
+
+    clustered_pc = cluster_pc(unique_endpoints, eps=eps)
+
+    return clustered_pc  # (U, C+1)
+
+
+def get_per_point_endpoints(pc: np.ndarray, cluster_id: np.ndarray, semantic_id: np.ndarray):
+    """compute endpoints for each cluster for each individual point
+    
+        these act as labels for line segments corresponding to the start and end points of each particle.
+        if you want to train a model to predict these endpoints, you can use these as labels.
+
+        start and end points are unordered, with the expectation that the loss will be a chamfer distance,
+        which is symmetric to ordering.
+
+        pc: Nx5, where each point is (x,y,z,e,t)
+        cluster_id: N, where each point is the cluster id of the particle it belongs to. cluster ids should be in order,
+                    i.e. [0,0,0,1,1,2,3,3,3,...]
+        semantic_id: N, where each point is the semantic id of the particle it belongs to.
+                    i.e. [0,0,0,1,1,2,3,3,3,...]. each cluster has the same semantic id.
+
+        returns: Nx6, where each point is (x1,y1,z1,x2,y2,z2)
+    """
+    cluster_size = np.bincount(cluster_id) # (C,)
+    endpoints = np.zeros((pc.shape[0], 6)) # (N, 6)
+    i = 0
+    for c in cluster_size:
+        if c <= 1:
+            continue
+        p1p2 = compute_endpoints(pc[i : i + c], semantic_id[i]) # (6,)
+        endpoints[i : i + c] = np.tile(p1p2, (c, 1)) # (N_C, 6)
+        i += c
+    return endpoints
