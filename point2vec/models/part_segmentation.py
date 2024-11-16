@@ -10,7 +10,7 @@ from torchmetrics import Accuracy, Precision
 
 from point2vec.modules.loss import SoftmaxFocalLoss, DiceLoss
 from point2vec.modules.feature_upsampling import PointNetFeatureUpsampling
-from point2vec.modules.pointnet import PointcloudTokenizer, PositionEmbeddingCoordsSine
+from point2vec.modules.pointnet import PointcloudTokenizer
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
 from point2vec.modules.masking import MaskedBatchNorm1d, masked_layer_norm
@@ -37,10 +37,9 @@ class Point2VecPartSegmentation(pl.LightningModule):
         encoder_attention_dropout: float = 0,
         encoder_drop_path_rate: float = 0.2,
         encoder_add_pos_at_every_layer: bool = True,
-        position_encoder: Optional[str] = "nn",
+        encoder_freeze: bool = False,
         embedding_type: Optional[str] = "mini",
         loss_func: str = "nll",
-        encoder_unfreeze_epoch: int = 0,
         seg_head_fetch_layers: List[int] = [3, 7, 11],
         seg_head_dim: int = 512,
         seg_head_dropout: float = 0.5,
@@ -51,17 +50,19 @@ class Point2VecPartSegmentation(pl.LightningModule):
         lr_scheduler_cosine_eta_min: float = 1e-6,
         pretrained_ckpt_path: str | None = None,
         train_transformations: List[str] = [
-            "center",
-            "unit_sphere",
+            "rotate",
         ],  # scale, center, unit_sphere, rotate, translate, height_norm
-        val_transformations: List[str] = ["center", "unit_sphere"],
+        val_transformations: List[str] = ["rotate"],
         transformation_scale_min: float = 0.8,
         transformation_scale_max: float = 1.2,
         transformation_scale_symmetries: Tuple[int, int, int] = (1, 0, 1),
-        transformation_rotate_dims: List[int] = [1],
+        transformation_rotate_dims: List[int] = [0,1,2],
         transformation_rotate_degs: Optional[int] = None,
         transformation_translate: float = 0.2,
         transformation_height_normalize_dim: int = 1,
+        # deprecated
+        position_encoder: str = "nn",
+        encoder_unfreeze_epoch: int = 0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -178,20 +179,25 @@ class Point2VecPartSegmentation(pl.LightningModule):
         self.val_precision = Precision("multiclass", num_classes=self.num_seg_classes, ignore_index=-1)
         self.train_mprecision = Precision("multiclass", num_classes=self.num_seg_classes, average="macro", ignore_index=-1)
 
-        match self.hparams.loss_func:
-            case "nll":
-                self.loss_func = nn.NLLLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1)
-            case "fancy":
-                self.loss_func = SoftmaxFocalLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1, gamma=2)
-                # self.dice_loss = DiceLoss(ignore_index=-1)
-                # self.loss_func = lambda logits, labels: 20 * self.dice_loss(logits, labels) + self.focal_loss(logits, labels)
-            case _:
-                raise ValueError(f"Unknown loss function: {self.hparams.loss_func}")
+        if self.hparams.loss_func == "nll":
+            self.loss_func = nn.NLLLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1)
+        elif self.hparams.loss_func in ["focal", "fancy"]:
+            self.loss_func = SoftmaxFocalLoss(weight=self.trainer.datamodule.class_weights, reduction='mean', ignore_index=-1, gamma=2)
+            # self.dice_loss = DiceLoss(ignore_index=-1)
+            # self.loss_func = lambda logits, labels: 20 * self.dice_loss(logits, labels) + self.focal_loss(logits, labels)
+        else:
+            raise ValueError(f"Unknown loss function: {self.hparams.loss_func}")
 
         if self.hparams.pretrained_ckpt_path is not None:  # type: ignore
             self.load_pretrained_checkpoint(self.hparams.pretrained_ckpt_path)  # type: ignore
 
-        self.encoder.requires_grad_(False)  # will unfreeze later
+
+        if self.hparams.encoder_freeze:
+            self.encoder.requires_grad_(False)
+            self.tokenizer.requires_grad_(False)
+            self.positional_encoding.requires_grad_(False)
+            if self.feature_encoder is not None:
+                self.feature_encoder.requires_grad_(False)
 
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
@@ -227,7 +233,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         tokens: torch.Tensor
         centers: torch.Tensor
         embedding_mask: torch.Tensor
-        tokens, centers, embedding_mask, _ = self.tokenizer(points, lengths, None)
+        tokens, centers, embedding_mask, _, _ = self.tokenizer(points, lengths, None, None)
         pos_embeddings = self.center_encoding(centers)
         output: TransformerEncoderOutput = self.encoder(
             tokens, pos_embeddings, embedding_mask, return_hidden_states=True
@@ -418,10 +424,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         print(f"Unexpected keys: {unexpected_keys}")
 
     def on_train_epoch_start(self) -> None:
-        if self.trainer.current_epoch == self.hparams.encoder_unfreeze_epoch:  # type: ignore
-            self.encoder.requires_grad_(True)
-            print("Unfreeze encoder")
-        # self.trainer.model = torch.compile(self.trainer.model, mode='reduce-overhead')
+        return
 
     def categorical_label(self, num_classes: int, label: torch.Tensor) -> torch.Tensor:
         # label: (B,)
