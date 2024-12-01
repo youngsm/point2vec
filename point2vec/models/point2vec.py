@@ -15,6 +15,7 @@ from point2vec.modules.pointnet import PointcloudTokenizer
 from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
 from point2vec.utils import transforms
 from profiling_decorator import profile
+from sklearn.metrics import classification_report
 
 
 class Point2Vec(pl.LightningModule):
@@ -28,6 +29,7 @@ class Point2Vec(pl.LightningModule):
         tokenizer_upscale_group_size: int | None = None,
         tokenizer_overlap_factor: float | None = None,
         tokenizer_reduction_method: str = 'energy', # method to reduce upscale group size to group size
+        tokenizer_embedding_checkpoint: str | None = None,
         d2v_masking_ratio: float = 0.65,
         d2v_masking_type: str = "rand",  # rand, block
         encoder_dim: int = 384,
@@ -37,6 +39,7 @@ class Point2Vec(pl.LightningModule):
         encoder_attention_dropout: float = 0.05,
         encoder_drop_path_rate: float = 0.25,
         encoder_add_pos_at_every_layer: bool = True,
+        encoder_qkv_bias: bool = True,
         use_relative_features: bool = False,
         decoder: bool = True,
         decoder_depth: int = 4,
@@ -44,6 +47,7 @@ class Point2Vec(pl.LightningModule):
         decoder_attention_dropout: float = 0.05,
         decoder_drop_path_rate: float = 0.25,
         decoder_add_pos_at_every_layer: bool = True,
+        decoder_qkv_bias: bool = True,
         position_encoder: Optional[str] = "nn",
         embedding_type: str = "mini",
         d2v_target_layers: List[int] = [6, 7, 8, 9, 10, 11],
@@ -53,12 +57,14 @@ class Point2Vec(pl.LightningModule):
         d2v_ema_tau_max: Optional[float] = 0.9998,
         d2v_ema_tau_min: Optional[float] = 0.99999,
         d2v_ema_tau_epochs: int = 200,
+        d2v_ema_tau_update_every: Optional[int] = None,
         loss: str = "smooth_l1",  # smooth_l1, mse
         learning_rate: float = 1e-3,
         optimizer_adamw_weight_decay: float = 0.05,
         lr_scheduler_linear_warmup_epochs: int = 80,
         lr_scheduler_linear_warmup_start_lr: float = 1e-6,
         lr_scheduler_cosine_eta_min: float = 1e-6,
+        lr_scheduler_stepping: str = 'epoch',
         train_transformations: List[str] = [
             # "subsample",
             # "scale",
@@ -76,7 +82,8 @@ class Point2Vec(pl.LightningModule):
         transformation_translate: float = 0.2,
         transformation_height_normalize_dim: int = 1,
         svm_validation: Dict[str, pl.LightningDataModule] = {},
-        svm_validation_C=0.012,  # C=0.012 copied from Point-M2AE code
+        svm_validation_C=0.005,  # C=0.012 copied from Point-M2AE code
+        svm_validation_max_tokens: int = 7500,
         fix_estimated_stepping_batches: Optional[int] = None,  # multi GPU bug fix
     ) -> None:
         super().__init__()
@@ -139,7 +146,14 @@ class Point2Vec(pl.LightningModule):
             token_dim=encoder_dim,
             num_channels=num_channels,
             embedding_type=embedding_type,
+            use_relative_features=use_relative_features,
         )
+        if tokenizer_embedding_checkpoint is not None:
+            self.tokenizer.load_state_dict(self.tokenizer.extract_model_checkpoint(tokenizer_embedding_checkpoint))
+            # freeze tokenizer
+            # for param in self.tokenizer.parameters():
+                # param.requires_grad = False
+            print("❄️  Loaded pretrained tokenizer and did not freeze it.")
 
         self.masking = VariablePointcloudMasking(
             ratio=d2v_masking_ratio, type=d2v_masking_type
@@ -159,11 +173,14 @@ class Point2Vec(pl.LightningModule):
         decoder_dpr = [
             x.item() for x in torch.linspace(0, decoder_drop_path_rate, decoder_depth)
         ]
+
+        print(f'🎲 Encoder qkv bias: {encoder_qkv_bias}')
+        print(f'🎲 Decoder qkv bias: {decoder_qkv_bias}')
         self.student = TransformerEncoder(
             embed_dim=encoder_dim,
             depth=encoder_depth,
             num_heads=encoder_heads,
-            qkv_bias=True,
+            qkv_bias=encoder_qkv_bias, # usually True
             drop_rate=encoder_dropout,
             attn_drop_rate=encoder_attention_dropout,
             drop_path_rate=dpr,
@@ -174,7 +191,7 @@ class Point2Vec(pl.LightningModule):
                 embed_dim=encoder_dim,
                 depth=decoder_depth,
                 num_heads=encoder_heads,
-                qkv_bias=True,
+                qkv_bias=decoder_qkv_bias,
                 drop_rate=decoder_dropout,
                 attn_drop_rate=decoder_attention_dropout,
                 drop_path_rate=decoder_dpr,
@@ -199,6 +216,16 @@ class Point2Vec(pl.LightningModule):
                 raise ValueError(f"Unknown loss: {loss}")
 
     def setup(self, stage: Optional[str] = None) -> None:
+        if self.hparams.d2v_ema_tau_epochs < 500:
+            # total # of steps * (tau_epochs / total_epochs)
+            tau_steps = (
+                self.hparams.fix_estimated_stepping_batches  # type: ignore
+                or self.trainer.estimated_stepping_batches
+            ) * (self.hparams.d2v_ema_tau_epochs / self.trainer.max_epochs)  # type: ignore
+        else:
+            tau_steps = self.hparams.d2v_ema_tau_epochs
+        print(f"Using tau steps: {tau_steps}")
+
         self.teacher = EMA(
             self.student,
             tau_min=0
@@ -207,29 +234,28 @@ class Point2Vec(pl.LightningModule):
             tau_max=1
             if self.hparams.d2v_ema_tau_max is None  # type: ignore
             else self.hparams.d2v_ema_tau_max,  # type: ignore
-            tau_steps=(
-                self.hparams.fix_estimated_stepping_batches  # type: ignore
-                or self.trainer.estimated_stepping_batches
-            )
-            * (self.hparams.d2v_ema_tau_epochs / self.trainer.max_epochs),  # type: ignore
+            tau_steps=tau_steps,
             update_after_step=0,
-            update_every=1,
+            update_every=1
+            if self.hparams.d2v_ema_tau_update_every is None  # type: ignore
+            else self.hparams.d2v_ema_tau_update_every,  # type: ignore
         )
         # Note: there is a bug in Lightning 1.7.7 that causes `self.trainer.estimated_stepping_batches` to crash when using multiple GPUs
         # see: https://github.com/Lightning-AI/lightning/issues/12317
         # Because of that, we allow to workaround this crash by manually setting this value with `fix_estimated_stepping_batches`.
 
-        # svm_validation: Dict[str, pl.LightningDataModule] = self.hparams.svm_validation  # type: ignore
-        # for dataset_name, datamodule in svm_validation.items():
-        #     datamodule.setup("fit")
-        #     for logger in self.loggers:
-        #         if isinstance(logger, WandbLogger):
-        #             logger.experiment.define_metric(
-        #                 f"svm_train_acc_{dataset_name}", summary="last,max"
-        #             )
-        #             logger.experiment.define_metric(
-        #                 f"svm_val_acc_{dataset_name}", summary="last,max"
-        #             )
+        svm_validation: Dict[str, pl.LightningDataModule] = self.hparams.svm_validation  # type: ignore
+        for dataset_name, datamodule in svm_validation.items():
+            datamodule.setup("fit")
+            print(f"🍗  Setup {dataset_name} datamodule for SVM validation.")
+            for logger in self.loggers:
+                if isinstance(logger, WandbLogger):
+                    logger.experiment.define_metric(
+                        f"svm_train_acc_{dataset_name}", summary="last,max"
+                    )
+                    logger.experiment.define_metric(
+                        f"svm_val_acc_{dataset_name}", summary="last,max"
+                    )
 
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
@@ -321,44 +347,81 @@ class Point2Vec(pl.LightningModule):
     ) -> None:
         svm_validation: Dict[str, pl.LightningDataModule] = self.hparams.svm_validation  # type: ignore
         for dataset_name, datamodule in svm_validation.items():
-            svm_train_acc, svm_val_acc = self.svm_validation(datamodule)
-            self.log(f"svm_train_acc_{dataset_name}", svm_train_acc)
-            self.log(f"svm_val_acc_{dataset_name}", svm_val_acc)
+            svm_train_acc, svm_val_acc, train_class_scores, val_class_scores = self.svm_validation(datamodule)
+            self.log(f"svm_train_acc_{dataset_name}", svm_train_acc, sync_dist=False)
+            self.log(f"svm_val_acc_{dataset_name}", svm_val_acc, sync_dist=False)
+            for label, score in train_class_scores.items():
+                self.log(f"svm_train_class_score_{dataset_name}_{label}", score, sync_dist=True)
+            for label, score in val_class_scores.items():
+                self.log(f"svm_val_class_score_{dataset_name}_{label}", score, sync_dist=True)
 
     def svm_validation(self, datamodule: pl.LightningDataModule) -> Tuple[float, float]:
         # Lightning controls the `training` and `grad_enabled` state. Don't want to mess with it, but make sure it's correct.
         assert not self.training
         assert not torch.is_grad_enabled()
 
-        def xy(
-            dataloader: DataLoader,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        max_tokens: int = self.hparams.svm_validation_max_tokens  # type: ignore
+        def xy(dataloader):
             x_list = []
             label_list = []
-            for (points, label) in iter(dataloader):
-                points: torch.Tensor = points.cuda()
-                label: torch.Tensor = label.cuda()
-                points = self.val_transformations(points)
-                embeddings, centers, _, _ = self.tokenizer(points)
-                pos = self.positional_encoding(centers)
-                x = self.student(embeddings, pos).last_hidden_state
-                x = torch.cat([x.max(dim=1).values, x.mean(dim=1)], dim=-1)
-                x_list.append(x.cpu())
-                label_list.append(label.cpu())
 
-            x = torch.cat(x_list, dim=0)  # (N, 768)
-            y = torch.cat(label_list, dim=0)  # (N,)
+            total =  max_tokens // (self.tokenizer.grouping.group_size * dataloader.batch_size) if max_tokens is not None else None
+
+            for i, (data, lengths, labels_batch, _) in enumerate(dataloader):
+                data = data.cuda()
+                lengths = lengths.cuda()
+                labels_batch = labels_batch.cuda()
+                with torch.no_grad():
+                    tokens, centers, mask, semantic_ids, _, _, _ = self.tokenizer(
+                        data, lengths, labels_batch, return_point_info=True)
+                    pos = self.center_encoding(centers)
+                    x = self.generate_targets(tokens, pos, mask).reshape(-1, 384)
+                    semantic_ids = semantic_ids.reshape(-1, pos.shape[1])
+
+                    # Vectorized computation to replace the loop
+                    N = semantic_ids.shape[0]  # Number of groups
+                    D = semantic_ids.shape[1]  # Number of semantic IDs per group
+
+                    group_indices = torch.arange(N, device=semantic_ids.device).unsqueeze(1).expand(-1, D)  # Shape: (N, D)
+                    semantic_ids_flat = semantic_ids.reshape(-1)
+                    group_indices_flat = group_indices.reshape(-1)
+                    valid_mask = semantic_ids_flat != -1
+                    semantic_ids_valid = semantic_ids_flat[valid_mask]  # Shape: (K,)
+                    group_indices_valid = group_indices_flat[valid_mask]  # Shape: (K,)
+                    num_labels = semantic_ids_valid.max().item() + 1
+                    counts = torch.zeros((N, num_labels), dtype=torch.int64, device=semantic_ids.device)
+                    counts.index_add_(0, group_indices_valid, torch.nn.functional.one_hot(semantic_ids_valid, num_classes=num_labels).to(torch.int64))
+                    y = counts.argmax(dim=1)  # Shape: (N,)
+                    mask_flat = mask.reshape(-1)
+                    x = x[mask_flat]
+                    y = y[mask_flat]
+                    x_list.append(x.cpu())
+                    label_list.append(y.cpu())
+
+                    if total is not None and i >= total:
+                        break
+
+            x = torch.cat(x_list, dim=0)[:max_tokens]
+            y = torch.cat(label_list, dim=0)[:max_tokens]
             return x, y
 
         x_train, y_train = xy(datamodule.train_dataloader())  # type: ignore
         x_val, y_val = xy(datamodule.val_dataloader())  # type: ignore
 
         svm_C: float = self.hparams.svm_validation_C  # type: ignore
-        svm = SVC(C=svm_C, kernel="linear")
+        svm = SVC(C=svm_C, kernel="linear", class_weight="balanced")
         svm.fit(x_train, y_train)  # type: ignore
         train_acc: float = svm.score(x_train, y_train)  # type: ignore
         val_acc: float = svm.score(x_val, y_val)  # type: ignore
-        return train_acc, val_acc
+
+        train_report = classification_report(y_train, svm.predict(x_train), output_dict=True)
+        val_report = classification_report(y_val, svm.predict(x_val), output_dict=True)
+
+        train_class_scores = {label: metrics['f1-score'] for label, metrics in train_report.items() if label.isdigit()}
+        val_class_scores = {label: metrics['f1-score'] for label, metrics in val_report.items() if label.isdigit()}
+
+        return train_acc, val_acc, train_class_scores, val_class_scores
 
     # https://github.com/Lightning-AI/lightning/issues/11688#issuecomment-1026688558
     def optimizer_step(self, *args, **kwargs) -> None:
@@ -464,13 +527,43 @@ class Point2Vec(pl.LightningModule):
             weight_decay=self.hparams.optimizer_adamw_weight_decay,  # type: ignore
         )
 
+        warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs
+        if self.hparams.lr_scheduler_stepping == 'step' and self.hparams.lr_scheduler_linear_warmup_epochs < 100: # epochs probably given
+            print("❗Performing LR scheduler every step!")
+            print('❗Assuming epochs given, not iters')
+            steps_per_epoch = self.trainer.num_training_batches
+            max_epochs = self.trainer.max_steps if self.trainer.max_steps is not None else self.trainer.max_epochs * steps_per_epoch
+            warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs * steps_per_epoch
+        elif self.hparams.lr_scheduler_stepping == 'step' and self.hparams.lr_scheduler_linear_warmup_epochs >= 100: # iters probably given
+            print("❗Performing LR scheduler every step!")
+            print('❗Assuming iters given in warmup, not epochs')
+            steps_per_epoch = self.trainer.num_training_batches
+            max_epochs = self.trainer.max_steps if self.trainer.max_steps is not None else self.trainer.max_epochs * steps_per_epoch
+            warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs # warmup iters
+
+
+        for name, val in zip(['max_epochs', 'warmup_epochs'], [max_epochs, warmup_epochs]):
+            print(f'\t{name}: {val}')
+
+        # freq = 100
         sched = LinearWarmupCosineAnnealingLR(
             opt,
-            warmup_epochs=self.hparams.lr_scheduler_linear_warmup_epochs,  # type: ignore
-            max_epochs=self.trainer.max_epochs,
+            warmup_epochs=warmup_epochs, # iters if step, epochs otherwise
+            max_epochs=max_epochs,       # iters if step, epochs otherwise
             warmup_start_lr=self.hparams.lr_scheduler_linear_warmup_start_lr,  # type: ignore
             eta_min=self.hparams.lr_scheduler_cosine_eta_min,  # type: ignore
         )
+
+        # print(f'Scheduling every {freq} steps...')
+        # print('warmup_epochs:', sched.warmup_epochs * freq)
+        # print('max_epochs:', sched.max_epochs * freq)
+
+        if self.hparams.lr_scheduler_stepping == 'step':
+            sched = {
+                "scheduler": sched,
+                "interval": "step",
+                # "frequency": freq,
+            }
 
         return [opt], [sched]
 
