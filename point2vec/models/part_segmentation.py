@@ -11,7 +11,7 @@ from torchmetrics import Accuracy, Precision
 from point2vec.modules.loss import SoftmaxFocalLoss, DiceLoss
 from point2vec.modules.feature_upsampling import PointNetFeatureUpsampling
 from point2vec.modules.pointnet import PointcloudTokenizer
-from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput
+from point2vec.modules.transformer import TransformerEncoder, TransformerEncoderOutput, PromptedTransformerEncoder
 from point2vec.utils import transforms
 from point2vec.modules.masking import MaskedBatchNorm1d, masked_layer_norm
 from point2vec.modules.segmentation import SegmentationHead
@@ -37,7 +37,12 @@ class Point2VecPartSegmentation(pl.LightningModule):
         encoder_attention_dropout: float = 0,
         encoder_drop_path_rate: float = 0.2,
         encoder_add_pos_at_every_layer: bool = True,
+        encoder_qkv_bias: bool = True,
         encoder_freeze: bool = False,
+        encoder_soft_prompt: bool = False,
+        encoder_soft_prompt_length: int = 10,
+        encoder_soft_prompt_dropout: float = 0.0,
+        encoder_soft_prompt_is_deep: bool = False,
         embedding_type: Optional[str] = "mini",
         loss_func: str = "nll",
         seg_head_fetch_layers: List[int] = [3, 7, 11],
@@ -48,6 +53,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         lr_scheduler_linear_warmup_epochs: int = 10,
         lr_scheduler_linear_warmup_start_lr: float = 1e-6,
         lr_scheduler_cosine_eta_min: float = 1e-6,
+        lr_scheduler_stepping: str = 'epoch',
         pretrained_ckpt_path: str | None = None,
         train_transformations: List[str] = [
             "rotate",
@@ -131,16 +137,35 @@ class Point2VecPartSegmentation(pl.LightningModule):
         dpr = [
             x.item() for x in torch.linspace(0, encoder_drop_path_rate, encoder_depth)
         ]
-        self.encoder = TransformerEncoder(
-            embed_dim=encoder_dim,
-            depth=encoder_depth,
-            num_heads=encoder_heads,
-            qkv_bias=True,
-            drop_rate=encoder_dropout,
-            attn_drop_rate=encoder_attention_dropout,
-            drop_path_rate=dpr,
-            add_pos_at_every_layer=encoder_add_pos_at_every_layer,
-        )
+
+        if encoder_soft_prompt:
+            self.encoder = PromptedTransformerEncoder(
+                        embed_dim=encoder_dim,
+                        depth=encoder_depth,
+                        num_heads=encoder_heads,
+                        qkv_bias=encoder_qkv_bias,
+                        drop_rate=encoder_dropout,
+                        attn_drop_rate=encoder_attention_dropout,
+                        drop_path_rate=dpr,
+                        add_pos_at_every_layer=encoder_add_pos_at_every_layer,
+                        # soft prompt params
+                        num_prompts=encoder_soft_prompt_length,
+                        num_channels=num_channels,
+                        points_per_token=tokenizer_group_size,
+                        prompt_dropout=encoder_soft_prompt_dropout,
+                        deep=encoder_soft_prompt_is_deep,
+                    )
+        else:
+            self.encoder = TransformerEncoder(
+                embed_dim=encoder_dim,
+                depth=encoder_depth,
+                num_heads=encoder_heads,
+                qkv_bias=encoder_qkv_bias,
+                drop_rate=encoder_dropout,
+                attn_drop_rate=encoder_attention_dropout,
+                drop_path_rate=dpr,
+                add_pos_at_every_layer=encoder_add_pos_at_every_layer,
+            )
 
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -193,7 +218,18 @@ class Point2VecPartSegmentation(pl.LightningModule):
 
 
         if self.hparams.encoder_freeze:
+            # freeze encoder params except for task-specific prompt embeddings
             self.encoder.requires_grad_(False)
+            if isinstance(self.encoder, PromptedTransformerEncoder):
+                print('🔥  Performing soft prompting.')
+                # unfreeze prompt embeddings
+                self.encoder.prompt_embeddings.requires_grad = True
+                if self.encoder.deep:
+                    self.encoder.deep_prompt_embeddings.requires_grad = True
+            else:
+                print('🔥  Performing linear probing.')
+
+            # freeze others as is usual
             self.tokenizer.requires_grad_(False)
             self.positional_encoding.requires_grad_(False)
             if self.feature_encoder is not None:
@@ -238,11 +274,23 @@ class Point2VecPartSegmentation(pl.LightningModule):
         output: TransformerEncoderOutput = self.encoder(
             tokens, pos_embeddings, embedding_mask, return_hidden_states=True
         )
+        batch_lengths = embedding_mask.sum(dim=1)
+
+        if self.hparams.encoder_soft_prompt: # remove prompt embeddings
+            embedding_mask = torch.cat([
+                torch.ones(B, self.encoder.num_prompts, device=embedding_mask.device, dtype=embedding_mask.dtype),
+                embedding_mask,
+            ], dim=1)
 
         hidden_states = [
             masked_layer_norm(output.hidden_states[i], output.hidden_states[i].shape[-1], embedding_mask)
             for i in self.hparams.seg_head_fetch_layers]  # type: ignore [(B, T, C)]
         token_features = torch.stack(hidden_states, dim=0).mean(0)  # (B, T, C)
+
+        if self.hparams.encoder_soft_prompt: # remove prompt embeddings
+            token_features = token_features[:, self.encoder.num_prompts:, :]
+        assert token_features.shape[1] == tokens.shape[1], "token_features and tokens must have the same number of tokens!"
+
         token_features_max = token_features.max(dim=1).values  # (B, C)
         token_features_mean = token_features.mean(dim=1)  # (B, C)
 
@@ -256,7 +304,6 @@ class Point2VecPartSegmentation(pl.LightningModule):
             + ([label_embedding] if label_embedding is not None else []), dim=-1
         )  # (B, 2*C' + L)
 
-        batch_lengths = embedding_mask.sum(dim=1)
         x = self.upsampling(
             points,
             centers[:, :, :3],
@@ -405,13 +452,41 @@ class Point2VecPartSegmentation(pl.LightningModule):
             lr=self.hparams.learning_rate,  # type: ignore
             weight_decay=self.hparams.optimizer_adamw_weight_decay,  # type: ignore
         )
+
+        warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs
+        max_epochs = self.trainer.max_epochs
+        if self.hparams.lr_scheduler_stepping == 'step' and self.hparams.lr_scheduler_linear_warmup_epochs < 100: # epochs probably given
+            print("❗Performing LR scheduler every step!")
+            print('❗Assuming epochs given, not iters')
+            steps_per_epoch = self.trainer.num_training_batches
+            max_epochs = self.trainer.max_steps if self.trainer.max_steps is not None else self.trainer.max_epochs * steps_per_epoch
+            warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs * steps_per_epoch
+        elif self.hparams.lr_scheduler_stepping == 'step' and self.hparams.lr_scheduler_linear_warmup_epochs >= 100: # iters probably given
+            print("❗Performing LR scheduler every step!")
+            print('❗Assuming iters given in warmup, not epochs')
+            steps_per_epoch = self.trainer.num_training_batches
+            max_epochs = self.trainer.max_steps if self.trainer.max_steps is not None else self.trainer.max_epochs * steps_per_epoch
+            warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs # warmup iters
+        else:
+            print('❗Performing LR scheduler every epoch.')
+
+        for name, val in zip(['max_epochs', 'warmup_epochs'], [max_epochs, warmup_epochs]):
+            print(f'\t{name}: {val}')
+
         sched = LinearWarmupCosineAnnealingLR(
             opt,
-            warmup_epochs=self.hparams.lr_scheduler_linear_warmup_epochs,  # type: ignore
-            max_epochs=self.trainer.max_epochs,
+            warmup_epochs=warmup_epochs, # iters if step, epochs otherwise
+            max_epochs=max_epochs,       # iters if step, epochs otherwise
             warmup_start_lr=self.hparams.lr_scheduler_linear_warmup_start_lr,  # type: ignore
             eta_min=self.hparams.lr_scheduler_cosine_eta_min,  # type: ignore
         )
+
+        if self.hparams.lr_scheduler_stepping == 'step':
+            sched = {
+                "scheduler": sched,
+                "interval": "step",
+            }
+
         return [opt], [sched]
 
     def load_pretrained_checkpoint(self, path: str) -> None:
@@ -423,8 +498,8 @@ class Point2VecPartSegmentation(pl.LightningModule):
         print(f"Missing keys: {missing_keys}")
         print(f"Unexpected keys: {unexpected_keys}")
 
-    def on_train_epoch_start(self) -> None:
-        return
+    # def on_train_epoch_start(self) -> None:
+    #     return
 
     def categorical_label(self, num_classes: int, label: torch.Tensor) -> torch.Tensor:
         # label: (B,)
