@@ -105,8 +105,15 @@ class VariablePointcloudMasking(nn.Module):
         self, centers: torch.Tensor, lengths: torch.Tensor
     ) -> torch.Tensor:
         # centers: (B, G, C)
+        # Create a mask for valid positions (positions within lengths)
+        valid_positions_mask = torch.arange(G, device=device).unsqueeze(
+            0
+        ) < lengths.unsqueeze(1)  # Shape: (B, G)
         if self.ratio == 0:
-            return torch.zeros(centers.shape[:2], device=centers.device, dtype=torch.bool)
+            masked = torch.zeros(centers.shape[:2], device=centers.device, dtype=torch.bool)
+            not_masked = torch.zeros_like(masked)
+            not_masked[valid_positions_mask] = True
+            return masked, not_masked
 
         B, G, _ = centers.shape
         device = centers.device
@@ -114,10 +121,6 @@ class VariablePointcloudMasking(nn.Module):
         # Generate random scores
         random_scores = torch.rand(B, G, device=device)
 
-        # Create a mask for valid positions (positions within lengths)
-        valid_positions_mask = torch.arange(G, device=device).unsqueeze(
-            0
-        ) < lengths.unsqueeze(1)  # Shape: (B, G)
 
         # Set random_scores for invalid positions to infinity so they are sorted to the end
         random_scores[~valid_positions_mask] = float("inf")
@@ -186,7 +189,7 @@ def tiny_value_of_dtype(dtype: torch.dtype):
     """
     if not dtype.is_floating_point:
         raise TypeError("Only supports floating point dtypes.")
-    if dtype == torch.float or dtype == torch.double:
+    if dtype == torch.float or dtype == torch.double or dtype == torch.bfloat16:
         return 1e-13
     elif dtype == torch.half:
         return 1e-4
@@ -321,9 +324,11 @@ class MaskedBatchNorm1d(nn.Module):
         self.running_mean.zero_()
         self.running_var.fill_(1)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask=None):
         # x: (B, C, L)
         # mask: (B, 1, L)
+        if mask is None:
+            mask = torch.ones_like(x[:, 0, :], device=x.device)
         B, C, L = x.size()
 
         # Ensure mask has the correct shape and type
