@@ -1,0 +1,94 @@
+# pytorch_lightning==1.7.2
+seed_everything: 0
+trainer:
+  sync_batchnorm: true
+  gradient_clip_val: 3
+  # gradient_clip_algorithm: null
+  # max_epochs: 50
+  max_steps: 100000
+  # log_every_n_steps: 50
+  precision: bf16
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  # strategy: fsdp
+  callbacks:
+  - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+    init_args:
+      monitor: svm_val_acc_larnet
+      mode: max
+      filename: "{epoch}-{step}-{svm_val_acc_larnet:.4f}"
+model:
+  num_channels: 4
+  tokenizer_num_init_groups: 256 # culled to context length
+  tokenizer_context_length: 128
+  tokenizer_group_size: 128
+  tokenizer_upscale_group_size: 1024
+  tokenizer_group_radius: 0.03289473684210526 # 25 / 760
+  tokenizer_overlap_factor: 0.55
+  tokenizer_reduction_method: fps # method to reduce upscale group size to group size
+  tokenizer_normalize_group_centers: true
+  # tokenizer_embedding_checkpoint: /sdf/home/y/youngsam/sw/dune/representations/group_embed/group_embedding_microtesting/jldpcslo/checkpoints/model-epoch=995-val_loss=0.0049.ckpt
+  use_relative_features: false
+  d2v_masking_ratio: 0.85
+  d2v_masking_type: rand
+  embedding_type: masked_mini
+  encoder_dim: 384
+  encoder_depth: 12
+  encoder_heads: 6
+  encoder_dropout: 0.0
+  encoder_attention_dropout: 0.05
+  encoder_drop_path_rate: 0.25
+  encoder_add_pos_at_every_layer: true
+  encoder_qkv_bias: true
+  decoder_depth: 4
+  decoder_dropout: 0.0
+  decoder_attention_dropout: 0.05
+  decoder_drop_path_rate: 0.25
+  decoder_add_pos_at_every_layer: true
+  decoder_qkv_bias: true
+  freeze_last_layer_iters: 95000
+  learning_rate:  1e-4
+  koleo_weight: 0.0
+  ae_weight: 1.0
+  ae_layer: encoder
+  optimizer_adamw_weight_decay: 0.1
+  lr_scheduler_linear_warmup_epochs: 12500
+  lr_scheduler_linear_warmup_start_lr: 8.6e-6
+  lr_scheduler_cosine_eta_min: 8.6e-6
+  lr_scheduler_stepping: 'step' # or 'epoch'
+  train_transformations:
+  - "rotate"
+  val_transformations: []
+  transformation_subsample_points: 1024
+  transformation_scale_min: 0.8
+  transformation_scale_max: 1.2
+  transformation_scale_symmetries: [1, 0, 1]
+  transformation_rotate_dims: [0,1,2]
+  transformation_rotate_degs: null
+  transformation_translate: 0.2
+  transformation_height_normalize_dim: 1
+  svm_validation:
+    larnet:
+      class_path: point2vec.datasets.LArNetDataModule
+      init_args:
+        data_path: /sdf/home/y/youngsam/data/dune/larnet/h5/DataAccessExamples/train/generic_v2*.h5
+        batch_size: 4
+        num_workers: 1
+        dataset_kwargs:
+          energy_threshold: 0.13
+          remove_low_energy_scatters: true
+          emin: 1.0e-6
+          emax: 20.0
+          maxlen: 60000
+data:
+  class_path: point2vec.datasets.LArNetDataModule
+  init_args:
+    data_path: /sdf/home/y/youngsam/data/dune/larnet/h5/DataAccessExamples/train/generic_v2*.h5
+    batch_size: 96
+    num_workers: 4
+    dataset_kwargs:
+      energy_threshold: 0.13
+      remove_low_energy_scatters: true
+      emin: 1.0e-6
+      emax: 20.0
+      maxlen: 850000
