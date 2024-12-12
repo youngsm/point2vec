@@ -116,57 +116,208 @@ class DiceLoss(nn.Module):
 
 
 class AggregateLoss(nn.Module):
-    def __init__(self, scheduler_type, **scheduler_kwargs):
+    def __init__(
+        self,
+        ce_weights,
+        bce_weights,
+        scheduler_type,
+        **scheduler_kwargs
+    ):
         super(AggregateLoss, self).__init__()
+
+        # register weights
+        self.ce_weights = ce_weights
+        self.bce_weights = bce_weights
+
+        # build scheduler
         self.size_scheduler = build_scheduler(scheduler_type, **scheduler_kwargs)
+
+        # build aggregator and matcher
         self.aggregator = PredictionAggregator(self.size_scheduler)
         self.matcher = HungarianMatcher()
 
+    def to(self, device):
+        self.ce_weights = self.ce_weights.to(device)
+        self.bce_weights = self.bce_weights.to(device)
+        return super().to(device)
+
+    def cuda(self):
+        self.ce_weights = self.ce_weights.cuda()
+        self.bce_weights = self.bce_weights.cuda()
+        return super().cuda()
+
     def forward(self, pred, target, voxel_size=None):
         """
-        pred: (B, G, P, 50, 13): (batch, group, point, proposal, features) features: (x,y,z,conf,9 logits)
-        target: (B, G, P, 10, 4): (batch, group, point, target, (x,y,z,cls))
+        pred: (B, G, P, F): (batch, group, point, features)
+        target: (B, G, T, 4): (batch, group, target_points, (x,y,z,cls))
         """
         if voxel_size is not None:
             self.aggregator.voxel_size = voxel_size
         assert pred.shape[:2] == target.shape[:2], 'batch and group dimensions must match'
-        active_mask = target[..., -1].gt(1e-8).any(dim=-1)  # Shape: (B, G) active groups
+        if self.ce_weights.device != pred.device:
+            self.ce_weights = self.ce_weights.to(pred.device)
+            self.bce_weights = self.bce_weights.to(pred.device)
+
+        B, G = pred.shape[:2]
+
+        # Determine active and inactive groups
+        # Active groups have at least one target keypoint
+        active_mask = target[..., -1].gt(0).any(dim=-1)  # Shape: (B, G)
+
+        # Aggregate predictions
         agg_pred = self.aggregator(pred, active_mask)
-        l1, ce_active = self._compute_active_loss(agg_pred, target, active_mask)
-        ce_inactive = self._compute_inactive_loss(pred, ~active_mask)
-        return {'l1': l1, 'ce_active': ce_active, 'ce_inactive': ce_inactive}
 
-    def _compute_active_loss(self, pred: torch.Tensor, target: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
-        pred = pred[active_mask]
-        target = target[active_mask]
-        assert pred.shape[0] == target.shape[0], 'batch dimensions must match'
+        # Compute losses
+        agg_pred_active = agg_pred[active_mask]
+        target_active = target[active_mask]
+        l1_loss, ce_loss, bce_active_loss = self._compute_active_loss(agg_pred_active, target_active)
 
-        # split pred and target
-        offset_pred, conf_pred, logit_pred = torch.split(pred, [3, 1, 9], dim=-1)
-        offset_pred_lens = offset_pred.ne(0.0).any(-1).sum(-1)
-        offset_target, cls_target = torch.split(target, [3, 1], dim=-1)
-        offset_target_lens = cls_target.ne(0.0).any(-1).sum(-1)
+        agg_pred_inactive = agg_pred[~active_mask]
+        bce_inactive_loss = self._compute_inactive_loss(agg_pred_inactive)
 
-        # hungarian match offset pred and target based on l1 distances
+        total_loss = {
+            'l1_loss': l1_loss,
+            'ce_loss': ce_loss,
+            'bce_active_loss': bce_active_loss,
+            'bce_inactive_loss': bce_inactive_loss
+        }
+
+        return total_loss
+
+    def _compute_active_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute losses for active groups (groups with keypoints):
+        - L1 Loss for matched predictions
+        - Cross-Entropy Loss for matched predictions
+        - Binary Cross-Entropy Loss for confidences (both matched and unmatched)
+        """
+        # Select active groups
+        N_active_groups = pred.shape[0]
+        device = pred.device
+
+        # Flatten predictions and targets
+        N_max = pred.shape[1]
+        pred = pred.reshape(-1, pred.shape[-1])  # Shape: (N_active_groups * N_max, F)
+        conf_pred = pred[:, 3]  # Confidence logits
+        offset_pred = pred[:, :3]  # Positions
+        logit_pred = pred[:, 4:]  # Class logits
+
+        # Prepare target confidences
+        # First, we need to identify matched and unmatched predictions
+
+        # Reshape targets
+        T = target.shape[1]
+        offset_target = target[:, :, :3]  # Positions
+        cls_target = target[:, :, 3]  # Class labels
+
+        # Flatten targets
+        offset_target = offset_target.reshape(-1, 3)  # Shape: (N_active_groups * T, 3)
+        cls_target = cls_target.reshape(-1)  # Shape: (N_active_groups * T,)
+
+        # Prepare lengths for matching
+        offset_pred_lens = torch.full((N_active_groups,), N_max, dtype=torch.long, device=device)
+        offset_target_lens = torch.full((N_active_groups,), T, dtype=torch.long, device=device)
+
+        # Reshape predictions for matching
+        offset_pred_reshaped = pred[:, :3].reshape(N_active_groups, N_max, 3)
+        offset_target_reshaped = target[:, :, :3]  # Shape: (N_active_groups, T, 3)
+
+        # Perform matching
         valid_batch_indices, valid_pred_indices, valid_target_indices = self.matcher(
-            offset_pred, offset_target, offset_pred_lens, offset_target_lens
+            offset_pred_reshaped, offset_target_reshaped, offset_pred_lens, offset_target_lens
         )
 
-        # Gather matched predictions and targets
-        matched_pred_offsets = offset_pred[valid_batch_indices, valid_pred_indices]
-        matched_pred_logits = logit_pred[valid_batch_indices, valid_pred_indices]
-        matched_target_offsets = offset_target[valid_batch_indices, valid_target_indices]
-        matched_target_classes = cls_target[valid_batch_indices, valid_target_indices]
+        # Create a mask for matched and unmatched predictions
+        total_preds = N_active_groups * N_max
+        matched_pred_mask = torch.zeros(total_preds, dtype=torch.bool, device=device)
+        matched_pred_indices_flat = valid_batch_indices * N_max + valid_pred_indices
+        matched_pred_mask[matched_pred_indices_flat] = True
 
-        # compute l1 loss and ce loss
-        regression_loss = F.l1_loss(matched_pred_offsets, matched_target_offsets)
-        classification_loss = F.cross_entropy(matched_pred_logits, matched_target_classes.squeeze(-1).long())
-        return regression_loss, classification_loss
+        # Target confidences for all predictions
+        target_confidences = torch.zeros(total_preds, device=device)
+        target_confidences[matched_pred_indices_flat] = 1.0  # Set target confidence to 1 for matched predictions
 
-    def _compute_inactive_loss(self, pred: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
-        # """compute just classification loss for all argmax(probs)=0"""
-        pred = pred[~active_mask].reshape(-1, pred.shape[-1])
-        logit_pred = pred[:, 4:]
-        classification_loss = F.cross_entropy(logit_pred, torch.zeros(logit_pred.shape[0], dtype=torch.long, device=logit_pred.device))
-        return classification_loss
-    
+        # Compute BCE Loss on confidences for all predictions
+        pos_weight = self.bce_weights[1] / self.bce_weights[0] # equiv to freq(0)/freq(1)
+        bce_loss = F.binary_cross_entropy_with_logits(conf_pred, target_confidences, pos_weight=pos_weight)
+        # bce_loss = focal_loss(conf_pred, target_confidences, pos_weight=pos_weight)
+
+        # Compute L1 and CE Losses for matched predictions
+        if matched_pred_indices_flat.numel() > 0:
+            matched_pred_offsets = offset_pred[matched_pred_mask]
+            matched_pred_logits = logit_pred[matched_pred_mask]
+            matched_target_offsets = offset_target[valid_batch_indices * T + valid_target_indices]
+            matched_target_classes = cls_target[valid_batch_indices * T + valid_target_indices].long()
+
+            # Compute Smooth L1 Loss
+            l1_loss = F.smooth_l1_loss(matched_pred_offsets, matched_target_offsets)
+
+            # Compute Cross-Entropy Loss
+            ce_loss = F.cross_entropy(matched_pred_logits, matched_target_classes, weight=self.ce_weights)
+        else:
+            raise ValueError('No matched predictions!')
+            l1_loss = torch.tensor(0.0, device=device)
+            ce_loss = torch.tensor(0.0, device=device)
+
+        return l1_loss, ce_loss, bce_loss
+
+    def _compute_inactive_loss(self, pred: torch.Tensor) -> torch.Tensor:
+        """
+        Compute BCE Loss on confidences for inactive groups (groups without keypoints)
+        """
+        if pred.numel() == 0:
+            # No inactive groups
+            return torch.tensor(0.0, device=pred.device)
+
+        # Flatten predictions
+        pred = pred.reshape(-1, pred.shape[-1])  # Shape: (N_inactive_groups * N_max, F)
+        conf_pred = pred[:, 3]  # Confidence logits
+
+        # Target confidences are all zeros
+        target_confidences = torch.zeros_like(conf_pred)
+
+        # Compute BCE Loss
+        pos_weight = self.bce_weights[1] / self.bce_weights[0]  # equiv to freq(0)/freq(1)
+        bce_loss = F.binary_cross_entropy_with_logits(conf_pred, target_confidences, pos_weight=pos_weight)
+        # bce_loss = focal_loss(conf_pred, target_confidences, pos_weight=pos_weight)
+
+        return bce_loss
+
+def focal_loss(inputs, targets, pos_weight=None, alpha=0.25, gamma=2):
+    BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none', pos_weight=pos_weight)
+    pt = torch.exp(-BCE_loss)  # Prevents nans when probability 0
+    F_loss = alpha * (1 - pt) ** gamma * BCE_loss
+    return F_loss.mean()
+
+# https://github.com/facebookresearch/dinov2/blob/main/dinov2/loss/koleo_loss.py
+class KoLeoLoss(nn.Module):
+    """Kozachenko-Leonenko entropic loss regularizer from Sablayrolles et al. - 2018 - Spreading vectors for similarity search"""
+
+    def __init__(self):
+        super().__init__()
+        self.pdist = nn.PairwiseDistance(2, eps=1e-8)
+
+    def pairwise_NNs_inner(self, x):
+        """
+        Pairwise nearest neighbors for L2-normalized vectors.
+        Uses Torch rather than Faiss to remain on GPU.
+        """
+        # parwise dot products (= inverse distance)
+        dots = torch.mm(x, x.t())
+        n = x.shape[0]
+        dots.view(-1)[:: (n + 1)].fill_(-1)  # Trick to fill diagonal with -1
+        # max inner prod -> min distance
+        _, I = torch.max(dots, dim=1)  # noqa: E741
+        return I
+
+    def forward(self, embeddings, eps=1e-8):
+        """
+        Args:
+            embeddings (BxD): backbone output of encoder
+        """
+        with torch.amp.autocast('cuda', enabled=False):
+            embeddings = F.normalize(embeddings, eps=eps, p=2, dim=-1)
+            I = self.pairwise_NNs_inner(embeddings)  # noqa: E741
+            distances = self.pdist(embeddings, embeddings[I])  # BxD, BxD -> B
+            loss = -torch.log(distances + eps).mean()
+        return loss
