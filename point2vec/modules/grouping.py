@@ -6,6 +6,10 @@ from cnms import cnms
 from pytorch3d import _C
 from typing import Optional, List, Union
 
+def masked_mean(group, point_mask):
+    valid_elements = point_mask.sum(-1).float() + 1e-10
+    return (group * point_mask.unsqueeze(-1)).sum(-2) / valid_elements.unsqueeze(-1)
+
 def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     """
     replaces all empty indices (-1) with the first index from its group
@@ -242,6 +246,7 @@ class PointcloudGrouping(nn.Module):
         context_length: int = 256,
         reduction_method: str = "energy",  # energy or fps
         use_relative_features: bool = False,
+        normalize_group_centers: bool = False,
     ):
         super().__init__()
         self.num_groups = num_groups
@@ -252,6 +257,8 @@ class PointcloudGrouping(nn.Module):
         self.context_length = context_length
         self.reduction_method = reduction_method
         self.use_relative_features = use_relative_features
+        self.normalize_group_centers = normalize_group_centers
+
     @torch.no_grad()
     def forward(
         self,
@@ -345,16 +352,6 @@ class PointcloudGrouping(nn.Module):
         group_lengths = (~idx.eq(-1)).all(2).sum(1) # (B,)
         embedding_mask = torch.arange(G, device=points.device).repeat(B, 1) < group_lengths.unsqueeze(1)
 
-        # Normalize group coordinates
-        if self.use_relative_features:
-            groups = groups - group_centers[:, :, None, :]
-        else:
-            groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers[:, :, None, :3]
-
-        if self.group_radius is not None:
-            groups[:, :, :, :3] = (
-                groups[:, :, :, :3] / self.group_radius
-            )  # proposed by PointNeXT to make relative coordinates less small
 
         # G (max groups) --> T (context length)
         # we are implicitly assuming that the number of non-padded groups is less than the context length. if 
@@ -366,6 +363,20 @@ class PointcloudGrouping(nn.Module):
             semantic_id_groups = semantic_id_groups[:, :self.context_length] # (B, G, K) --> (B, T, K)
         if endpoints_groups is not None:
             endpoints_groups = endpoints_groups[:, :self.context_length] # (B, G, K, 6) --> (B, T, K, 6)
+
+        if self.normalize_group_centers:
+            group_centers = masked_mean(groups, point_mask)
+
+        # Normalize group coordinates
+        if self.use_relative_features:
+            groups = groups - group_centers[:, :, None, :]
+        else:
+            groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers[:, :, None, :3]
+
+        if self.group_radius is not None:
+            groups[:, :, :, :3] = (
+                groups[:, :, :, :3] / self.group_radius
+            )  # proposed by PointNeXT to make relative coordinates less small
 
         return (
             groups,
