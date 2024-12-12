@@ -28,6 +28,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
         tokenizer_upscale_group_size: int | None = None,
         tokenizer_overlap_factor: float | None = None,
         tokenizer_reduction_method: str = 'fps',
+        tokenizer_normalize_group_centers: bool = False,
         use_relative_features: bool = True,
         label_embedding_dim: int = 64,
         encoder_dim: int = 384,
@@ -115,6 +116,7 @@ class Point2VecPartSegmentation(pl.LightningModule):
             embedding_type=embedding_type,
             reduction_method=tokenizer_reduction_method,
             use_relative_features=use_relative_features,
+            normalize_group_centers=tokenizer_normalize_group_centers,
         )
 
         self.positional_encoding = nn.Sequential(
@@ -257,7 +259,8 @@ class Point2VecPartSegmentation(pl.LightningModule):
                 lengths: torch.Tensor,
                 label: Optional[torch.Tensor] = None,
                 class_mask: slice | None = None,
-                return_logits: bool = False) -> torch.Tensor:
+                return_logits: bool = False,
+                return_features: bool = False) -> torch.Tensor:
         # points: (B, N, 3)
         # lengths: (B,)
         # label:  (B, N, 1)
@@ -313,9 +316,14 @@ class Point2VecPartSegmentation(pl.LightningModule):
             batch_lengths,
             point_mask,
         )  # (B, N, C)
+
         x = torch.cat(
             [x, global_feature.unsqueeze(-1).expand(-1, -1, N).transpose(1, 2)], dim=-1
         )  # (B, N, C'); C' = 3*C (+ L if we cared about event-wide embeddings)
+
+        if return_features:
+            return x, point_mask
+
         x = self.seg_head(x.transpose(1, 2), point_mask).transpose(1, 2)  # (B, N, cls)
         if class_mask is not None:
             x = x[..., class_mask]

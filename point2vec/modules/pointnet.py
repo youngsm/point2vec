@@ -128,6 +128,7 @@ class PointcloudTokenizer(nn.Module):
         embedding_type: str = "mini",
         reduction_method: str = 'energy',
         use_relative_features: bool = False,
+        normalize_group_centers: bool = False,
     ) -> None:
         super().__init__()
         self.token_dim = token_dim
@@ -140,6 +141,7 @@ class PointcloudTokenizer(nn.Module):
             context_length=context_length,
             reduction_method=reduction_method,
             use_relative_features=use_relative_features,
+            normalize_group_centers=normalize_group_centers,
         )
 
         if embedding_type == "mini":
@@ -192,3 +194,8 @@ class PointcloudTokenizer(nn.Module):
                 semantic_id_groups,
                 endpoints_groups,
             )
+
+    @staticmethod
+    def extract_model_checkpoint(path: str):
+        checkpoint = torch.load(path, weights_only=True)
+        return {k.replace("embed.", "embedding."):v for k,v in checkpoint["state_dict"].items() if k.startswith("embed.")}

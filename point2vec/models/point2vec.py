@@ -29,6 +29,7 @@ class Point2Vec(pl.LightningModule):
         tokenizer_upscale_group_size: int | None = None,
         tokenizer_overlap_factor: float | None = None,
         tokenizer_reduction_method: str = 'energy', # method to reduce upscale group size to group size
+        tokenizer_normalize_group_centers: bool = False,
         tokenizer_embedding_checkpoint: str | None = None,
         d2v_masking_ratio: float = 0.65,
         d2v_masking_type: str = "rand",  # rand, block
@@ -147,6 +148,7 @@ class Point2Vec(pl.LightningModule):
             num_channels=num_channels,
             embedding_type=embedding_type,
             use_relative_features=use_relative_features,
+            normalize_group_centers=tokenizer_normalize_group_centers,
         )
         if tokenizer_embedding_checkpoint is not None:
             self.tokenizer.load_state_dict(self.tokenizer.extract_model_checkpoint(tokenizer_embedding_checkpoint))
@@ -540,7 +542,6 @@ class Point2Vec(pl.LightningModule):
             steps_per_epoch = self.trainer.num_training_batches
             max_epochs = self.trainer.max_steps if self.trainer.max_steps is not None else self.trainer.max_epochs * steps_per_epoch
             warmup_epochs = self.hparams.lr_scheduler_linear_warmup_epochs # warmup iters
-
 
         for name, val in zip(['max_epochs', 'warmup_epochs'], [max_epochs, warmup_epochs]):
             print(f'\t{name}: {val}')
