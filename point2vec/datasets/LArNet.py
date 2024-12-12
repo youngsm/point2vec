@@ -32,17 +32,19 @@ class LArNet(Dataset):
         self.remove_low_energy_scatters = remove_low_energy_scatters
         self.dbscan_eps = dbscan_eps
         
-        if isinstance(endpoints, str):
-            match endpoints:
-                case 'unique':
-                    def endpoint_fn(pc, cluster_id, semantic_id):
-                        return get_unique_endpoints(pc, cluster_id, semantic_id, eps=self.dbscan_eps)
+        self.endpoint_fn = get_unique_endpoints
 
-                    self.endpoint_fn = endpoint_fn
-                case 'per-point':
-                    self.endpoint_fn = get_per_point_endpoints
-                case _:
-                    raise ValueError(f"endpoints must be 'unique' or 'per-point', got {endpoints}")
+        # if isinstance(endpoints, str):
+        #     match endpoints:
+        #         case 'unique':
+        #             def endpoint_fn(pc, cluster_id, semantic_id):
+        #                 return get_unique_endpoints(pc, cluster_id, semantic_id, eps=self.dbscan_eps)
+
+        #             self.endpoint_fn = endpoint_fn
+        #         case 'per-point':
+        #             self.endpoint_fn = get_per_point_endpoints
+        #         case _:
+        #             raise ValueError(f"endpoints must be 'unique' or 'per-point', got {endpoints}")
                 
         self.maxlen = maxlen
         self.initted = False
@@ -135,10 +137,10 @@ class LArNet(Dataset):
             cluster_id = cluster_id[threshold_mask]
 
         # Compute endpoints if needed (for line detection)
-        endpoints = None
-        if hasattr(self, 'endpoint_fn'):
-            endpoints = self.endpoint_fn(data, cluster_id, data_semantic_id)
-            endpoints = torch.from_numpy(endpoints).float()
+        # endpoints = None
+        # if hasattr(self, 'endpoint_fn'):
+        endpoints = get_unique_endpoints(data, cluster_id, data_semantic_id)
+        endpoints = torch.from_numpy(endpoints).float()
 
         # normalize the point cloud to [-1,1]^3
         if self.normalize:
@@ -209,7 +211,6 @@ class LArNetDataModule(pl.LightningDataModule):
             "low energy deposit": [4],
         }
         # inverse mapping
-
         self._seg_class_to_category = {}
         for cat in self._category_to_seg_classes.keys():
             for cls in self._category_to_seg_classes[cat]:
