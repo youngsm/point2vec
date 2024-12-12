@@ -1,33 +1,22 @@
 import torch
 import torch.nn as nn
-from torch_scatter import scatter_mean, scatter_max
-from math import cos, pi
+from torch_scatter import scatter_mean, scatter_max, scatter_sum
 
 class VoxelClustering(nn.Module):
     def __init__(self, size_scheduler):
         super(VoxelClustering, self).__init__()
         self.size_scheduler = size_scheduler
 
-    def forward(self, pred, active_mask):
-        B, G, P, F = pred.shape
-        device = pred.device
-
-        # Step 1: Identify active groups (groups with at least one valid target point)
-        active_pred = pred[active_mask]  # Shape: (N_active, P, F)
+    @torch.no_grad()
+    def forward(self, active_pred, active_mask):
+        _, P, F = active_pred.shape
 
         # Create batch_id and group_id for each point
-        batch_ids = torch.arange(B, device=device).view(B, 1, 1).expand(B, G, P)
-        group_ids = torch.arange(G, device=device).view(1, G, 1).expand(B, G, P)
-
-        # Concatenate batch_id, group_id with the point proposals
-        batch_group_ids = torch.cat(
-            (batch_ids.unsqueeze(-1), group_ids.unsqueeze(-1)), dim=-1
-        )  # Shape: (B, G, P, 2)
-
-        batch_group_ids = batch_group_ids[active_mask]  # Shape: (N_active, P, 2)
+        active_indices = active_mask.nonzero()
+        batch_group_ids = active_indices[:, :2].view(-1, 1, 2).expand(-1, P, -1) # (N_active, P, 2)
 
         # Flatten batch_group_ids and active_pred
-        batch_group_ids = batch_group_ids.reshape(-1, 2)
+        batch_group_ids = batch_group_ids.reshape(-1, 2)  # Shape: (N_active * P, 2)
         offsets_flattened = active_pred.reshape(-1, F)  # Shape: (N_active * P, F)
         offsets = offsets_flattened[:, :3]  # Shape: (N_active * P, 3)
 
@@ -50,24 +39,32 @@ class PredictionAggregator(nn.Module):
     def forward(self, pred, active_mask):
         B, G, P, F = pred.shape
         device = pred.device
+
+        # --- Cluster predictions into large voxels ---
+        active_indices = active_mask.nonzero(as_tuple=False)
+        pred = pred[active_indices[:, 0], active_indices[:, 1]]
         unique_keys, cluster_indices = self.voxel_clustering(pred, active_mask)
 
-        pred_flat = pred[active_mask].reshape(-1, F)  # Shape: (N_active * P, F)
-        confidences_logits = pred_flat[:, 3]  # Shape: (N_active * P,)
-        logits = pred_flat[:, 4:]  # Shape: (N_active * P, num_classes)
+        # --- Aggregate clustered predictions ---
+        pred_flat = pred.reshape(-1, F)  # Shape: (N_active * P, F)
+        conf_logits = pred_flat[:, 3]  # Shape: (N_active * P,)
+        class_logits = pred_flat[:, 4:]  # Shape: (N_active * P, num_classes)
 
-        # Apply sigmoid to confidences
-        confidences = torch.sigmoid(confidences_logits)  # Shape: (N_active * P,)
+        # Convert confidence logits to probabilities
+        conf_probs = torch.sigmoid(conf_logits)
 
-        # Aggregate using scatter operations
-        max_weighted_logits, _ = scatter_max(logits, cluster_indices, dim=0)
-        max_confidences, _ = scatter_max(confidences, cluster_indices, dim=0)
-        centroids = scatter_mean(
-            pred_flat[:, :3] * confidences.unsqueeze(1), cluster_indices, dim=0
-        )
+        # Compute weights
+        sum_conf_probs = scatter_sum(conf_probs, cluster_indices, dim=0)
+        weights = conf_probs / sum_conf_probs[cluster_indices]
+
+        # aggregate positions, confidence logits, and class logits
+        centroids = scatter_sum(pred_flat[:, :3] * weights.unsqueeze(1), cluster_indices, dim=0)
+        aggregated_conf_logits = scatter_sum(conf_logits * weights, cluster_indices, dim=0)
+        aggregated_conf_probs = torch.sigmoid(aggregated_conf_logits)
+        aggregated_class_logits = scatter_sum(class_logits * weights.unsqueeze(1), cluster_indices, dim=0)
 
         agg_pred = torch.cat(
-            [centroids, max_confidences.unsqueeze(1), max_weighted_logits], dim=1
+            [centroids, aggregated_conf_probs.unsqueeze(1), aggregated_class_logits], dim=1
         )  # Shape: (N_clusters, F_agg)
 
         batch_ids, group_ids = unique_keys[:, 0], unique_keys[:, 1]

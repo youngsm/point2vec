@@ -60,7 +60,7 @@ def group_endpoints(
     return endpoints_groups, endpoints_mask
 
 
-class Point2VecKeyPointGeneration(pl.LightningModule):
+class Point2VecPointProposalNetwork(pl.LightningModule):
     def __init__(
         self,
         num_channels: int = 3,
@@ -81,7 +81,8 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
         encoder_add_pos_at_every_layer: bool = True,
         embedding_type: Optional[str] = "mini",
         loss_scheduler: str = "cosine",
-        loss_scheduler_kwargs: Dict[str, float] = {'start_value': 0.2, 'end_value': 0.05, 'total_steps': 90},
+        loss_scheduler_kwargs: Dict[str, float] = {'start_value': 0.2, 'end_value': 0.05, 'total_steps': 90, 'verbose': True},
+        loss_weights: Dict[str, float] = {'l1_loss': 1.0, 'ce_loss': 0.0, 'bce_active_loss': 1.0, 'bce_inactive_loss': 1.0},
         encoder_unfreeze_epoch: int = 0,
         seg_head_fetch_layers: List[int] = [3, 7, 11],
         seg_head_dim: int = 512,
@@ -182,14 +183,29 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
             add_pos_at_every_layer=encoder_add_pos_at_every_layer,
         )
 
-        self.loss_func = AggregateLoss(loss_scheduler, **loss_scheduler_kwargs)
+        # inverse class freq for number of particles in each endpoint, going from 1 to 8
+        ce_weights = torch.tensor([1.05291874e+00, 2.90516482e+01,
+                                   1.02639605e+02, 2.21044118e+02,
+                                   7.08267016e+02, 7.31237838e+03,
+                                   9.01860000e+04, 9.01860000e+04])
+
+        # approximate inverse class freq for active/inactive predictions (100% of inactive group predictions,
+        # 30% of active group predictions are expected to be low confidence)
+        # # active group / # inactive groups is ~0.46
+        bce_weights = torch.tensor([1.4627, 3.1612])
+        self.loss_func = AggregateLoss(
+            bce_weights=bce_weights,
+            ce_weights=ce_weights,
+            scheduler_type=loss_scheduler,
+            **loss_scheduler_kwargs)
+        self.loss_weights = loss_weights
 
         self.ppn_head = nn.Sequential(
             nn.Linear(3 * encoder_dim, 512),
             nn.GELU(),
             nn.Linear(512, 256),
             nn.GELU(),
-            nn.Linear(256, 50 * (3 + 1 + 9)), # (pos + conf + npoint logits (up to 0-8))
+            nn.Linear(256, 50 * (3 + 1 + 8)), # (pos + conf + npoint logits (up to 1-8))
         )
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -257,19 +273,18 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
             masked_layer_norm(output.hidden_states[i], output.hidden_states[i].shape[-1], embedding_mask)
             for i in self.hparams.seg_head_fetch_layers]  # type: ignore [(B, T, C)]
         token_features = torch.stack(hidden_states, dim=0).mean(0)  # (B, T, C)
-        token_features_max = token_features.max(dim=1).values  # (B, C)
-        token_features_mean = token_features.mean(dim=1)  # (B, C)
-
-    
-        x = torch.cat(
-            [token_features, token_features_max, token_features_mean], dim=-1
-        )  # (B, 3*C')
+        token_features_max = (
+            token_features.max(dim=1).values.unsqueeze(1).expand(-1, T, -1)
+        )  # (B, T, C)
+        token_features_mean = (
+            token_features.mean(dim=1).unsqueeze(1).expand(-1, T, -1)
+        )  # (B, T, C)
 
         x = torch.cat(
             [token_features, token_features_max, token_features_mean], dim=-1
         )  # (B, T, 3*C')
 
-        x = self.ppn_head(x).reshape(B, T, -1, 3 + 1 + 9)
+        x = self.ppn_head(x).reshape(B, T, -1, 3 + 1 + 8)
 
         endpoints_groups, endpoints_mask = group_endpoints(
         centers=centers,
@@ -284,6 +299,12 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
         pred = x
         target = endpoint_offsets
         return pred, target
+
+    def combine_losses(self, losses: Dict[str, torch.Tensor]) -> torch.Tensor:
+        total_loss = torch.tensor(0.0, device=next(iter(losses.values())).device)
+        for k in losses:
+            total_loss += self.loss_weights[k] * losses[k]
+        return total_loss
 
     def training_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
@@ -302,11 +323,14 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
         pred = pred.float()
         target = target.float()
         losses = self.loss_func(pred, target)
-        loss = losses['l1'] + (losses['ce_active'] + losses['ce_inactive']) / 2
+
+        loss = self.combine_losses(losses)
 
         self.log("train_loss", loss, on_epoch=True)
         for k,v in losses.items():
             self.log(f"train_{k}", v, on_epoch=True)
+
+        self.log('voxel_size', self.loss_func.size_scheduler.value)
 
         return loss
 
@@ -328,8 +352,7 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
         pred = pred.float()
         target = target.float()
         losses = self.loss_func(pred, target)
-        loss = losses['l1'] + (losses['ce_active'] + losses['ce_inactive']) / 2
-
+        loss = self.combine_losses(losses)
         self.log("val_loss", loss)
         for k,v in losses.items():
             self.log(f"val_{k}", v)
@@ -353,7 +376,7 @@ class Point2VecKeyPointGeneration(pl.LightningModule):
         )
         return [opt], [sched]
 
-    def on_train_epoch_end(self, outputs, batch, batch_idx):
+    def on_train_epoch_end(self):
         # Update the voxel size scheduler's value
         self.loss_func.size_scheduler.step()
 
