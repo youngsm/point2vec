@@ -186,7 +186,7 @@ class PointMAE(pl.LightningModule):
             )
         
         self.increase_dim = nn.Sequential(
-            nn.Conv1d(encoder_dim, num_channels*encoder_dim, 1),
+            nn.Conv1d(encoder_dim, num_channels*tokenizer_group_size, 1),
         )
 
         self.do_koleo = koleo_weight > 0
@@ -389,8 +389,8 @@ class PointMAE(pl.LightningModule):
                     tokens, centers, mask, semantic_ids, _, _, _ = self.tokenizer(
                         data, lengths, labels_batch, return_point_info=True)
                     pos = self.center_encoding(centers)
-                    x = self.encoder(tokens, pos, mask).last_hidden_state.reshape(-1, 384)
-                    semantic_ids = semantic_ids.reshape(-1, pos.shape[1])
+                    x = self.encoder(tokens, pos, mask).last_hidden_state.reshape(-1, self.hparams.encoder_dim)
+                    semantic_ids = semantic_ids.reshape(-1, semantic_ids.shape[2])
 
                     # Vectorized computation to replace the loop
                     N = semantic_ids.shape[0]  # Number of groups
