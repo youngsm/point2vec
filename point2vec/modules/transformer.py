@@ -53,65 +53,160 @@ class Attention(nn.Module):
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
-
     ):
         super().__init__()
+        self.dim = dim
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.head_dim = head_dim
         self.scale = qk_scale or head_dim**-0.5
+        # We will compute Q, K, V differently for cross-attention
+        # so let's just keep a single linear projection for Q, K, V each.
+
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        # self.q_proj.weight = self.qkv.weight[:dim]
+        # self.q_proj.bias = self.qkv.bias[:dim]
+
+        # self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        # self.k_proj.weight = self.qkv.weight[dim:dim*2]
+        # self.k_proj.bias = self.qkv.bias[dim:dim*2]
+
+        # self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        # self.v_proj.weight = self.qkv.weight[dim*2:]
+        # self.v_proj.bias = self.qkv.bias[dim*2:]
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, attn_mask=None, use_flash_attn=True):
+    def q_proj(self, x):
+        return F.linear(x, self.qkv.weight[:self.dim], self.qkv.bias[:self.dim])
+
+    def k_proj(self, x):
+        return F.linear(x, self.qkv.weight[self.dim:2*self.dim], self.qkv.bias[self.dim:2*self.dim])
+
+    def v_proj(self, x):
+        return F.linear(x, self.qkv.weight[2*self.dim:], self.qkv.bias[2*self.dim:])
+
+    def forward(self, x, x_attn_mask=None, y=None, y_attn_mask=None):
+        """
+        x: queries (B, N, C)
+        y (optional): If provided, should be (B, M, C) used for K, V.
+                              Otherwise, K, V come from x (self-attention).
+        """
         B, N, C = x.shape
 
-        # Split into q, k, v and reshape
-        qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        ) # (3, B, H, N, dim-per-head)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        if y is None:
+            # Reshape Q, K, V
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # (B, H, N, D)
+            q, k, v = qkv[0], qkv[1], qkv[2]
 
-        if use_flash_attn:
-            # Prepare attn_mask
-            if attn_mask is not None:
-                # (B, 1, N, N) --> (B * num_heads, N, N)
-                attn_mask = attn_mask.squeeze(1).repeat_interleave(self.num_heads, dim=0)
-
-            # Reshape q, k, v for scaled_dot_product_attention
-            q = q.reshape(B * self.num_heads, N, self.head_dim)
-            k = k.reshape(B * self.num_heads, N, self.head_dim)
-            v = v.reshape(B * self.num_heads, N, self.head_dim)
-
-            # Perform scaled dot product attention using PyTorch's built-in function
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=self.attn_drop.p
-            )
-
-            # Reshape and project the output
-            attn_output = attn_output.reshape(B, self.num_heads, N, self.head_dim)
-            x = attn_output.transpose(1, 2).reshape(B, N, C)
-
-            _attn = None
-        else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
-
-            if attn_mask is not None:
-                attn = attn + attn_mask  # attn_mask should be broadcastable to attn
-
+            if x_attn_mask is not None:
+                attn = attn + x_attn_mask
             attn = attn.softmax(dim=-1)
             _attn = attn
             attn = self.attn_drop(attn)
-
             x = (attn @ v).transpose(1, 2).reshape(B, N, C)
 
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x, y, _attn
+
+        B, N, C = x.shape
+        L = y.shape[1]
+
+
+        # Cross attention of y on x and y
+        x = torch.cat([x, y], dim=1)
+        qkv = self.qkv(x).reshape(B, N+L, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q[:, :, N:]) @ k[:, :, :].transpose(-2, -1) * self.scale
+        if x_attn_mask is not None:
+            attn = attn + torch.cat([x_attn_mask, y_attn_mask], dim=-1)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        y = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        y = self.proj(y)
+        y = self.proj_drop(y)
+
+        # Self attention of x on x
+        attn = (q[:, :, :N]) @ k[:, :, :N].transpose(-2, -1) * self.scale
+        if x_attn_mask is not None:
+            attn = attn + x_attn_mask
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v[:, :, :N]).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, _attn
+
+        _attn = None
+        return x, y, _attn
+
+
+    # def forward(self, x, attn_mask=None, use_flash_attn=True, key_value=None):
+    #     """
+    #     x: queries (B, N, C)
+    #     key_value (optional): If provided, should be (B, M, C) used for K, V.
+    #                           Otherwise, K, V come from x (self-attention).
+    #     """
+    #     B, N, C = x.shape
+
+    #     if key_value is None:
+    #         # Self-Attention
+    #         q = self.q_proj(x)
+    #         k = self.k_proj(x)
+    #         v = self.v_proj(x)
+    #         M = N
+    #     else:
+    #         # Cross-Attention: Q from x, K and V from key_value
+    #         q = self.q_proj(x)
+    #         k = self.k_proj(key_value)
+    #         v = self.v_proj(key_value)
+    #         M = k.shape[1]
+
+    #     # Reshape Q, K, V
+    #     q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0,2,1,3) # (B, H, N, D)
+    #     k = k.reshape(B, M, self.num_heads, self.head_dim).permute(0,2,1,3) # (B, H, M, D)
+    #     v = v.reshape(B, M, self.num_heads, self.head_dim).permute(0,2,1,3) # (B, H, M, D)
+
+
+    #     if use_flash_attn:
+    #         # Prepare attn_mask
+    #         if attn_mask is not None:
+    #             # Adjust attn_mask dimensions to (B * H, N, M)
+    #             attn_mask = attn_mask.squeeze(1).repeat_interleave(self.num_heads, dim=0)
+
+    #         # Reshape for scaled_dot_product_attention
+    #         q = q.reshape(B * self.num_heads, N, self.head_dim)
+    #         k = k.reshape(B * self.num_heads, M, self.head_dim)
+    #         v = v.reshape(B * self.num_heads, M, self.head_dim)
+
+    #         attn_output = F.scaled_dot_product_attention(
+    #             q, k, v, attn_mask=attn_mask, dropout_p=self.attn_drop.p
+    #         )
+
+    #         # Reshape back
+    #         attn_output = attn_output.reshape(B, self.num_heads, N, self.head_dim)
+    #         x = attn_output.transpose(1, 2).reshape(B, N, C)
+    #         _attn = None
+
+    #     else:
+    #         attn = (q @ k.transpose(-2, -1)) * self.scale
+    #         if attn_mask is not None:
+    #             attn = attn + attn_mask
+    #         attn = attn.softmax(dim=-1)
+    #         _attn = attn
+    #         attn = self.attn_drop(attn)
+    #         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
+    #     x = self.proj(x)
+    #     x = self.proj_drop(x)
+    #     return x, _attn
 
 
 class Block(nn.Module):
@@ -154,18 +249,52 @@ class Block(nn.Module):
             drop=drop,
         )
 
-    def forward(self, x, attn_mask=None, embedding_mask=None, use_flash_attn=True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _x, attn = self.attn(self.norm1(x, embedding_mask), attn_mask, use_flash_attn)
-        x = x + self.drop_path(_x, embedding_mask)
-        ffn = self.mlp(self.norm2(x, embedding_mask))
-        if embedding_mask is not None:
-            ffn = ffn * embedding_mask.unsqueeze(-1)
-        x = x + self.drop_path(ffn, embedding_mask)
-        return x, attn, ffn
+    def forward(
+        self,
+        x,
+        x_attn_mask=None,
+        x_mask=None,
+        y=None,
+        y_attn_mask=None,
+        y_mask=None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if y is None:
+            _x, _, attn = self.attn(self.norm1(x, x_mask), x_attn_mask)
+            x = x + self.drop_path(_x, x_mask)
+            ffn = self.mlp(self.norm2(x, x_mask))
+            if x_mask is not None:
+                ffn = ffn * x_mask.unsqueeze(-1)
+            x = x + self.drop_path(ffn, x_mask)
+            y = None
+            return x, y, attn
 
-@dataclass()
+        _x, _y, attn = self.attn(
+            x=self.norm1(x, x_mask), 
+            x_attn_mask=x_attn_mask, 
+            y=self.norm1(y, y_mask), 
+            y_attn_mask=y_attn_mask
+        )
+        x = x + self.drop_path(_x, x_mask)
+        y = y + self.drop_path(_y, y_mask)
+
+        ffn_x = self.mlp(self.norm2(x, x_mask))
+        ffn_y = self.mlp(self.norm2(y, y_mask))
+
+        if x_mask is not None:
+            ffn_x = ffn_x * x_mask.unsqueeze(-1)
+        if y_mask is not None:
+            ffn_y = ffn_y * y_mask.unsqueeze(-1)
+
+        x = x + self.drop_path(ffn_x, x_mask)
+        y = y + self.drop_path(ffn_y, y_mask)
+
+        return x, y, attn
+
+
+@dataclass
 class TransformerEncoderOutput:
     last_hidden_state: torch.Tensor  # (B, T, C)
+    last_hidden_state_y: torch.Tensor | None = None  # (B, T, C)
     hidden_states: Optional[List[torch.Tensor]] = None  # [(B, T, C)]
     attentions: Optional[List[torch.Tensor]] = None  # [(B, H, T)]
     ffns: Optional[List[torch.Tensor]] = None  # [(B, T, C)]
@@ -184,6 +313,7 @@ class TransformerEncoder(nn.Module):
         attn_drop_rate=0.0,
         drop_path_rate: float | List[float] = 0.0,
         add_pos_at_every_layer=False,
+        postnorm=True,
     ):
         super().__init__()
 
@@ -206,59 +336,104 @@ class TransformerEncoder(nn.Module):
         )
 
         # output norm
-        self.norm = MaskedLayerNorm(embed_dim)
+        self.norm = MaskedLayerNorm(embed_dim) if postnorm else Identity()
 
         self.add_pos_at_every_layer = add_pos_at_every_layer
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
 
     def forward(
         self,
         x: torch.Tensor,
-        pos: torch.Tensor,
-        embedding_mask: torch.Tensor | None = None,
+        pos_x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
+        pos_y: torch.Tensor | None = None,
+        y_mask: torch.Tensor | None = None,
         return_hidden_states: bool = False,
         return_attentions: bool = False,
         return_ffns: bool = False,
     ) -> TransformerEncoderOutput:
-
-        if embedding_mask is not None:
+        """
+        If memory is provided, the blocks will perform cross-attention:
+        Q from x, K/V from memory.
+        If memory is None, self-attention is performed.
+        """
+        if x_mask is not None:
             B, N, C = x.shape
-            assert embedding_mask.shape == (
+            assert x_mask.shape == (
                 B,
                 N,
-            ), "embedding_mask must be of shape (B, N)"
+            ), "x_mask must be of shape (B, N)"
 
-            # Create additive attention mask of shape (B, 1, N, N)
-            attn_mask = (
-                embedding_mask.unsqueeze(1).unsqueeze(2) & embedding_mask.unsqueeze(1).unsqueeze(3)
-            )
-            attn_mask = (
-                (~attn_mask).to(x.dtype)
-                .masked_fill(~attn_mask, -1e9)
-            )
+            def create_attn_mask(mask):
+                attn_mask =(
+                    mask.unsqueeze(1).unsqueeze(2) & mask.unsqueeze(1).unsqueeze(3)
+                )
+                attn_mask = (
+                    (~attn_mask).to(x.dtype)
+                    .masked_fill(~attn_mask, -1e9)
+                )
+                return attn_mask
 
+            x_attn_mask = create_attn_mask(x_mask)
+
+            # Create additive attention mask of shape (B, 1, N, N) for self-attention
+            # If cross-attention is used, we need a (B, 1, N, M) mask.
+            if y_mask is None:
+                y_attn_mask = None
+            else:
+                # Cross-attention: we need both query and key_value masks
+                assert y_mask is not None, "y_mask is required for cross-attention"
+                B_k, N_key, C_k = y.shape
+                assert B == B_k, "Batch size must match between x and key_value"
+                assert y_mask.shape == (B, N_key), "y_mask must be (B, N_key)"
+                x_attn_mask = create_attn_mask(x_mask)
+                y_attn_mask = create_attn_mask(y_mask)
         else:
-            attn_mask = None
+            x_attn_mask = None
+            y_attn_mask = None
 
         hidden_states = [] if return_hidden_states else None
         attentions = [] if return_attentions else None
         ffns = [] if return_ffns else None
+
         if not self.add_pos_at_every_layer:
-            x = x + pos
+            x = x + pos_x
+            if y is not None:
+                y = y + pos_y
+
         for block in self.blocks:
             if self.add_pos_at_every_layer:
-                x = x + pos
-            x, attn, ffn = block(x, attn_mask, embedding_mask, use_flash_attn=not return_attentions)
+                x = x + pos_x
+                if y is not None:
+                    y = y + pos_y
+            x, y, attn = block(
+                x,
+                x_attn_mask,
+                x_mask,
+                y,
+                y_attn_mask,
+                y_mask,
+            )
             if return_hidden_states:
                 assert hidden_states is not None
                 hidden_states.append(x)
             if return_attentions:
                 assert attentions is not None
                 attentions.append(attn)
-            if return_ffns:
-                assert ffns is not None
-                ffns.append(ffn)
-        x = self.norm(x, embedding_mask)
-        return TransformerEncoderOutput(x, hidden_states, attentions, ffns)
+
+        x = self.norm(x, x_mask)
+        if y is not None:
+            y = self.norm(y, y_mask)
+        return TransformerEncoderOutput(x, y, hidden_states, attentions, ffns)
 
 
 class PromptedTransformerEncoder(TransformerEncoder):
