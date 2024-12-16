@@ -378,8 +378,8 @@ class Point2Vec(pl.LightningModule):
                     tokens, centers, mask, semantic_ids, _, _, _ = self.tokenizer(
                         data, lengths, labels_batch, return_point_info=True)
                     pos = self.center_encoding(centers)
-                    x = self.generate_targets(tokens, pos, mask).reshape(-1, 384)
-                    semantic_ids = semantic_ids.reshape(-1, pos.shape[1])
+                    x = self.generate_targets(tokens, pos, mask).reshape(-1, self.hparams.encoder_dim)
+                    semantic_ids = semantic_ids.reshape(-1, semantic_ids.shape[2])
 
                     # Vectorized computation to replace the loop
                     N = semantic_ids.shape[0]  # Number of groups
