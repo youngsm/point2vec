@@ -6,10 +6,13 @@ from cnms import cnms
 from pytorch3d import _C
 from typing import Optional, List, Union
 
+@torch.no_grad()
 def masked_mean(group, point_mask):
-    valid_elements = point_mask.sum(-1).float() + 1e-10
+    valid_elements = point_mask.sum(-1).float().clamp(min=1)
     return (group * point_mask.unsqueeze(-1)).sum(-2) / valid_elements.unsqueeze(-1)
 
+
+@torch.no_grad()
 def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     """
     replaces all empty indices (-1) with the first index from its group
@@ -21,6 +24,7 @@ def fill_empty_indices(idx: torch.Tensor) -> torch.Tensor:
     # print(f"DEBUG: {(len(idx[mask].view(-1)) / len(idx.view(-1))) * 100:.1f}% of ball query indices are empty")
     return idx
 
+@torch.no_grad()
 def masked_gather(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     """
     Helper function for torch.gather to collect the points at
@@ -71,7 +75,7 @@ def masked_gather(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     # selected_points[idx_expanded_mask] = 0.0
     return selected_points
 
-
+@torch.no_grad()
 def sample_farthest_points(
     points: torch.Tensor,
     lengths: Optional[torch.Tensor] = None,
@@ -141,9 +145,9 @@ def sample_farthest_points(
     # Generate the starting indices for sampling
     start_idxs = torch.zeros_like(lengths)
     if random_start_point:
-        for n in range(N):
-            # pyre-fixme[6]: For 1st param expected `int` but got `Tensor`.
-            start_idxs[n] = torch.randint(high=lengths[n], size=(1,)).item()
+        rand_uniform = torch.rand(N, device=lengths.device)
+        scaled_rand = rand_uniform * lengths.float()
+        start_idxs = scaled_rand.long()
 
     with torch.no_grad():
         # pyre-fixme[16]: `pytorch3d_._C` has no attribute `sample_farthest_points`.
@@ -151,7 +155,7 @@ def sample_farthest_points(
     sampled_points = masked_gather(points, idx)
     return sampled_points, idx
 
-
+@torch.no_grad()
 def select_topk_by_energy(
     points: torch.Tensor,
     idx: torch.Tensor,
@@ -204,6 +208,7 @@ def select_topk_by_energy(
 
     return topk_idx
 
+@torch.no_grad()
 def select_topk_by_fps(points: torch.Tensor, idx: torch.Tensor, K: int) -> torch.Tensor:
     """
     Args:
@@ -243,7 +248,7 @@ class PointcloudGrouping(nn.Module):
         group_radius: float,
         upscale_group_size: int = 512,
         overlap_factor: float = 0.7,
-        context_length: int = 256,
+        context_length: int | None = None,
         reduction_method: str = "energy",  # energy or fps
         use_relative_features: bool = False,
         normalize_group_centers: bool = False,
@@ -270,23 +275,32 @@ class PointcloudGrouping(nn.Module):
         # points: (B, N, C)
         # lengths: (B,)
 
-        # Sample farthest points using lengths
-        group_centers, _ = sample_farthest_points(
-            points,
+
+        possible_centers, _ = sample_farthest_points(
+            points[...,:3].float(),
             K=self.num_groups,
             lengths=lengths,
-            random_start_point=False,
+            random_start_point=True,
         )  # (B, G, 3)
+        if self.overlap_factor is not None:
+            # run cnms
+            retain = cnms(
+                possible_centers,
+                overlap_factor=self.overlap_factor,
+                radius=self.group_radius,
+                K=self.num_groups,
+            )
+            lengths1 = retain.sum(dim=1)
+
+            # reindex group centers to be retained points first, then discarded after so we can use lengths1
+            idx = torch.argsort((~retain).long(), dim=1)  # shape [G, K]
+            group_centers = possible_centers.gather(dim=1, index=idx.unsqueeze(-1).expand(-1, -1, 3))
+            group_centers = group_centers[:,:self.context_length]
+        else:
+            lengths1 = None
 
         semantic_id_groups = None
         endpoints_groups = None
-
-        # Sphere culling
-        if self.overlap_factor is not None:
-            retain = cnms(group_centers, overlap_factor=self.overlap_factor, radius=self.group_radius)
-            lengths1 = retain.sum(dim=1)
-        else:
-            lengths1 = None
 
         if self.upscale_group_size is None:
             self.upscale_group_size = self.num_groups
@@ -345,38 +359,45 @@ class PointcloudGrouping(nn.Module):
         # Create point mask with shape (B, G, K)
         point_lengths = (~idx.eq(-1)).sum(2)  # (B, G)
         groups = masked_gather(points, fill_empty_indices(idx))  # (B, G, K, C)
-        point_mask = torch.arange(self.group_size, device=idx.device).expand(groups.size(0), self.context_length, -1) < point_lengths[:, :self.context_length].unsqueeze(-1)  # (B, G, K)
+        B,G,K = idx.shape
+        # T = min(self.context_length, G)
+        T = self.context_length
+        point_mask = torch.arange(K, device=idx.device).expand(B, T, -1) < point_lengths[:, :T].unsqueeze(-1)  # (B, G, K)
 
         # Create embedding mask (i.e. which groups/embeddings to ignore in transformer)
         B, G, K, C = groups.shape
         group_lengths = (~idx.eq(-1)).all(2).sum(1) # (B,)
         embedding_mask = torch.arange(G, device=points.device).repeat(B, 1) < group_lengths.unsqueeze(1)
 
-
         # G (max groups) --> T (context length)
         # we are implicitly assuming that the number of non-padded groups is less than the context length. if 
         # this is not the case, some valid groups will be ignored, which is terrible. be careful!
-        groups = groups[:, :self.context_length] # (B, G, K, C) --> (B, T, K, C)
-        group_centers = group_centers[:, :self.context_length] # (B, G, 3) --> (B, T, 3)
-        embedding_mask = embedding_mask[:, :self.context_length] # (B, G) --> (B, T)
+        K = point_lengths.max()
+        groups = groups[:, :T, :K] # (B, G, K, C) --> (B, T, K, C)
+        point_mask = point_mask[:, :, :K] # (B, G, K) --> (B, T, K)
+        group_centers = group_centers[:, :T] # (B, G, 3) --> (B, T, 3)
+        embedding_mask = embedding_mask[:, :T] # (B, G) --> (B, T)
         if semantic_id_groups is not None:
-            semantic_id_groups = semantic_id_groups[:, :self.context_length] # (B, G, K) --> (B, T, K)
+            semantic_id_groups = semantic_id_groups[:, :T] # (B, G, K) --> (B, T, K)
         if endpoints_groups is not None:
-            endpoints_groups = endpoints_groups[:, :self.context_length] # (B, G, K, 6) --> (B, T, K, 6)
+            endpoints_groups = endpoints_groups[:, :T] # (B, G, K, 6) --> (B, T, K, 6)
 
         if self.normalize_group_centers:
             group_centers = masked_mean(groups, point_mask)
 
         # Normalize group coordinates
         if self.use_relative_features:
-            groups = groups - group_centers[:, :, None, :]
+            groups = groups - group_centers.unsqueeze(2).expand(-1,-1,K,-1)
         else:
-            groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers[:, :, None, :3]
+            groups[:, :, :, :3] = groups[:, :, :, :3] - group_centers[..., :3].unsqueeze(2).expand(-1,-1,K,-1)
 
         if self.group_radius is not None:
             groups[:, :, :, :3] = (
                 groups[:, :, :, :3] / self.group_radius
             )  # proposed by PointNeXT to make relative coordinates less small
+
+        # zero out groups/tokens that are padded. not necessary but helpful for debugging
+        groups *= embedding_mask.unsqueeze(-1).unsqueeze(-1)
 
         return (
             groups,
