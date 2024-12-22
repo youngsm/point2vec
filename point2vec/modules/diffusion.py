@@ -87,3 +87,20 @@ class DiffusionParameters(nn.Module):
         self.register_buffer('sigma', self.betas * (1.0 - self.alpha_bar_t_minus_one) / (1.0 - self.alpha_bar))
         self.register_buffer('sqrt_alphas', torch.sqrt(self.alphas))
         self.register_buffer('sqrt_alpha_bar_minus_one', torch.sqrt(self.alpha_bar_t_minus_one))
+
+
+class PointOrderEncoder(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.time_embed = nn.Sequential(
+            TimeEmbedding(dim),
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, points):
+        # points: (B, N, C)
+        inp = torch.arange(points.shape[1], device=points.device) # (N)
+        temb = self.time_embed(inp) # (N, 256)
+        temb = temb.unsqueeze(0) # (1, N, 256)
+        return temb

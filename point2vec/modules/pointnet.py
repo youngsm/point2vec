@@ -5,6 +5,7 @@ import torch.nn as nn
 import math
 from .grouping import PointcloudGrouping
 from .masking import MaskedBatchNorm1d
+from .diffusion import PointOrderEncoder
 
 @torch.no_grad()
 def get_pos_embed(embed_dim, ipt_pos, scale=1024):
@@ -53,7 +54,7 @@ class MiniPointNet(nn.Module):
             nn.Conv1d(512, feature_dim, 1),
         )
 
-    def forward(self, points, mask=None) -> torch.Tensor:
+    def forward(self, points) -> torch.Tensor:
         # points: (B, N, C)
         feature = self.first_conv(points.transpose(2, 1))  # (B, 256, N)
         feature_global = torch.max(feature, dim=2, keepdim=True).values  # (B, 256, 1)
@@ -67,7 +68,7 @@ class MiniPointNet(nn.Module):
 
 
 class MaskedMiniPointNet(nn.Module):
-    def __init__(self, channels: int, feature_dim: int):
+    def __init__(self, channels: int, feature_dim: int, equivariant: bool = False):
         super().__init__()
         self.first_conv = nn.Sequential(
             nn.Conv1d(channels, 128, 1, bias=False),
@@ -83,16 +84,23 @@ class MaskedMiniPointNet(nn.Module):
             nn.Conv1d(512, feature_dim, 1),
         )
 
+        self.equivariant = equivariant
+        if equivariant:
+            self.position_encoder = PointOrderEncoder(256)
+
     def forward(self, points, mask) -> torch.Tensor:
         # points: (B, N, C)
         # mask: (B, 1, N)
-
+        # pos: (B, N, 256)
         feature = points.transpose(2, 1)  # (B, C, N)
         for layer in self.first_conv:
             if isinstance(layer, MaskedBatchNorm1d):
                 feature = layer(feature, mask)
             else:
                 feature = layer(feature)
+
+        if self.equivariant:
+            feature = feature + self.position_encoder(points).transpose(2,1)
 
         # (B, 256, N) --> (B, 256, 1)
         feature_global = torch.max(feature, dim=2, keepdim=True).values  # (B, 256, 1)
