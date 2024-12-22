@@ -7,6 +7,7 @@
 __global__ void greedy_reduction_cuda_kernel(
     const int* __restrict__ sorted_indices,    // Shape: (N, P)
     const int* __restrict__ idx,              // Shape: (N, P, K)
+    const int* __restrict__ lengths,          // Shape: (N,)
     bool* __restrict__ retain,                // Shape: (N, P)
     int num_batches,
     int num_spheres,
@@ -15,9 +16,14 @@ __global__ void greedy_reduction_cuda_kernel(
     int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (batch_idx >= num_batches) return;
 
-    // Initialize retain array for this batch
+    // Initialize retain array for this batch -- ones for valid length, zeros for invalid length
+    int valid_length = lengths[batch_idx];
     for (int i = 0; i < num_spheres; ++i) {
-        retain[batch_idx * num_spheres + i] = true;
+        if (i >= valid_length) {
+            retain[batch_idx * num_spheres + i] = false;
+        } else {
+            retain[batch_idx * num_spheres + i] = true;
+        }
     }
 
     // Perform greedy reduction for this batch
@@ -42,6 +48,7 @@ __global__ void greedy_reduction_cuda_kernel(
 void launch_greedy_reduction_cuda_kernel(
     const int* sorted_indices,
     const int* idx,
+    const int* lengths,
     bool* retain,
     int num_batches,
     int num_spheres,
@@ -55,6 +62,7 @@ void launch_greedy_reduction_cuda_kernel(
     greedy_reduction_cuda_kernel<<<blocks, threads>>>(
         sorted_indices,
         idx,
+        lengths,
         retain,
         num_batches,
         num_spheres,

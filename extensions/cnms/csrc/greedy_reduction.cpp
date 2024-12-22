@@ -6,6 +6,7 @@
 void greedy_reduction_cpu_kernel(
     const int* sorted_indices,
     const int* idx,
+    const int* lengths, // New
     bool* retain,
     int num_batches,
     int num_spheres,
@@ -15,6 +16,7 @@ void greedy_reduction_cpu_kernel(
 void launch_greedy_reduction_cuda_kernel(
     const int* sorted_indices,
     const int* idx,
+    const int* lengths, // New
     bool* retain,
     int num_batches,
     int num_spheres,
@@ -24,7 +26,8 @@ void launch_greedy_reduction_cuda_kernel(
 // C++ Interface Function
 torch::Tensor greedy_reduction(
     torch::Tensor sorted_indices,
-    torch::Tensor idx
+    torch::Tensor idx,
+    torch::Tensor lengths
 ) {
     // Check that input tensors are 2D and 3D respectively
     TORCH_CHECK(sorted_indices.dim() == 2, "sorted_indices must be a 2D tensor");
@@ -51,60 +54,48 @@ torch::Tensor greedy_reduction(
     // Initialize retain tensor
     auto retain = torch::ones({num_batches, num_spheres}, torch::dtype(torch::kBool).device(sorted_indices.device()));
 
+    // Ensure tensors are contiguous and of type int32 or int64
+    TORCH_CHECK(sorted_indices.dtype() == torch::kInt32 || sorted_indices.dtype() == torch::kInt64,
+                "sorted_indices must be of type int32 or int64");
+    TORCH_CHECK(idx.dtype() == torch::kInt32 || idx.dtype() == torch::kInt64,
+                "idx must be of type int32 or int64");
+    TORCH_CHECK(lengths.dtype() == torch::kInt32 || lengths.dtype() == torch::kInt64,
+                "lengths must be of type int32 or int64");
+
+    // Convert tensors to int32 if they are int64 for better performance
+    if (sorted_indices.dtype() == torch::kInt64) {
+        sorted_indices = sorted_indices.to(torch::kInt32);
+    }
+    if (idx.dtype() == torch::kInt64) {
+        idx = idx.to(torch::kInt32);
+    }
+    if (lengths.dtype() == torch::kInt64) {
+        lengths = lengths.to(torch::kInt32);
+    }
+
+    // Get raw pointers
+    const int* sorted_indices_ptr = sorted_indices.data_ptr<int>();
+    const int* idx_ptr = idx.data_ptr<int>();
+    const int* lengths_ptr = lengths.data_ptr<int>();
+    bool* retain_ptr = retain.data_ptr<bool>();
+
     if (is_cuda) {
-        // Ensure tensors are contiguous and of type int32
-        TORCH_CHECK(sorted_indices.dtype() == torch::kInt32 || sorted_indices.dtype() == torch::kInt64,
-                    "sorted_indices must be of type int32 or int64");
-        TORCH_CHECK(idx.dtype() == torch::kInt32 || idx.dtype() == torch::kInt64,
-                    "idx must be of type int32 or int64");
-
-        // Convert tensors to int32 if they are int64 for better performance
-        if (sorted_indices.dtype() == torch::kInt64) {
-            sorted_indices = sorted_indices.to(torch::kInt32);
-        }
-        if (idx.dtype() == torch::kInt64) {
-            idx = idx.to(torch::kInt32);
-        }
-
-        // Get raw pointers
-        const int* sorted_indices_ptr = sorted_indices.data_ptr<int>();
-        const int* idx_ptr = idx.data_ptr<int>();
-        bool* retain_ptr = retain.data_ptr<bool>();
-
         // Launch CUDA kernel
         launch_greedy_reduction_cuda_kernel(
             sorted_indices_ptr,
             idx_ptr,
+            lengths_ptr,
             retain_ptr,
             num_batches,
             num_spheres,
             num_neighbors
         );
-    }
-    else {
-        // Ensure tensors are contiguous and of type int32
-        TORCH_CHECK(sorted_indices.dtype() == torch::kInt32 || sorted_indices.dtype() == torch::kInt64,
-                    "sorted_indices must be of type int32 or int64");
-        TORCH_CHECK(idx.dtype() == torch::kInt32 || idx.dtype() == torch::kInt64,
-                    "idx must be of type int32 or int64");
-
-        // Convert tensors to int32 if they are int64 for better performance
-        if (sorted_indices.dtype() == torch::kInt64) {
-            sorted_indices = sorted_indices.to(torch::kInt32);
-        }
-        if (idx.dtype() == torch::kInt64) {
-            idx = idx.to(torch::kInt32);
-        }
-
-        // Get raw pointers
-        const int* sorted_indices_ptr = sorted_indices.data_ptr<int>();
-        const int* idx_ptr = idx.data_ptr<int>();
-        bool* retain_ptr = retain.data_ptr<bool>();
-
+    } else {
         // Launch CPU kernel
         greedy_reduction_cpu_kernel(
             sorted_indices_ptr,
             idx_ptr,
+            lengths_ptr,
             retain_ptr,
             num_batches,
             num_spheres,
