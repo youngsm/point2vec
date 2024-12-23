@@ -24,7 +24,7 @@ def cnms(centroids, radius, overlap_factor, K=None, lengths=None):
         lengths = torch.full(
             (N,),
             fill_value=P,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=centroids.device
         )
 
